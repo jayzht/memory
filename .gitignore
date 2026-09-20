@@ -9,3 +9,12 @@ data/longmemeval/
 
 # scratch
 .commit_msg.tmp
+.tmp/
+# throwaway virtualenv for the MCP tests (needs mcp>=2, kept out of the main env)
+.venv-mcp/
+.venv-wheel/
+.uv-cache/
+
+# build output
+dist/
+dist-core/

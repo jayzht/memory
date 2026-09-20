@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memory3l-mcp"
+version = "0.1.0"
+description = "Auditable three-layer memory over MCP: an append-only fact ledger and verifiable invariants I1-I5, served read-only from SQLite"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "memory", "audit", "provenance", "provenance-tracking", "agents", "llm"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# `mcp>=2` is a hard requirement and a breaking boundary: the ergonomic server
+# class was renamed FastMCP -> MCPServer in 2.0, and `mcp.server.fastmcp` now
+# raises on import by design. Pin the major so a resolver cannot silently install
+# a v1 whose import path does not exist here.
+#
+# `memory3l` carries the audit core. It is a real dependency now that the core is
+# published; `MEMORY3L_ROOT` remains as a development override (see bootstrap.py).
+dependencies = ["mcp>=2,<3", "memory3l>=1.0,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+memory3l-mcp = "memory3l_mcp:main"
+memory3l-mcp-install-skill = "memory3l_mcp.skills:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memory3l_mcp"]
+
+# The skills bundle travels inside the wheel: `memory3l-mcp-install-skill` copies it
+# from here, and a wheel without it would make that command fail on a machine that
+# only ever ran `uvx`.
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "memory3l_mcp/skills"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "skills", "README.md", "server.json", "scripts"]
