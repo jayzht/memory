@@ -243,7 +243,22 @@ MEMORY3L_ROOT=$PWD PYTHONPATH=$PWD/memory3l-mcp/src \
 | `memory3l-mcp/skills/memory-audit/SKILL.md` | 跨 agent 技能：何时用哪个工具、以及**如何不过度声称** |
 | `memory3l-mcp/server.json` | MCP Registry 元数据（`registryType: pypi`、`runtimeHint: uvx`） |
 
-**已发布**（PyPI）：`memory3l 1.0.0`、`memory3l-mcp 0.1.0`。
+**已发布**（PyPI + MCP Registry）：
+
+| 位置 | 内容 |
+|---|---|
+| PyPI | `memory3l 1.0.0`、`memory3l-mcp 0.1.0` |
+| MCP Registry | `io.github.jayzht/memory3l-mcp`（`registryType: pypi`、`runtimeHint: uvx`、stdio） |
+
+```bash
+uvx memory3l-mcp                                  # 无需仓库、无需 MEMORY3L_ROOT
+memory3l-mcp-install-skill                        # → ~/.agents/skills/memory-audit
+curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.jayzht/memory3l-mcp"
+```
+
+Registry 的所有权校验靠 **PyPI 上的 README** 含 `mcp-name:` 标记并与 `server.json` 的 `name` 完全一致——所以**改了 README 里的名字就必须同步改 `server.json`**，否则下一次发布会被拒。
+
+验证方式：从 PyPI 全新装（干净 venv，仓库不在 `sys.path`）→ stdio 握手 10 个工具 → `store_info` / `list_episodes` / `audit` 全部返回正确结果；Registry 条目另经公开 API 检索复核。发布流程是 `mcp-publisher login github`（交互式 OAuth）→ `publish`，事后已 `logout` 清除本地凭据。
 
 ```bash
 uvx memory3l-mcp                                  # 无需仓库、无需 MEMORY3L_ROOT
