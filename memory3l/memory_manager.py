@@ -191,6 +191,10 @@ class MemoryManager:
         self.summarizer_failures = 0
         self.summary_truncations = 0
         self.capacity_merges_rejected = 0
+        #: batch-ingestion window.  1 (the default) is the only setting under which
+        #: a turn is summarised against the chain produced by *every* earlier turn;
+        #: >1 trades that guarantee for wall clock -- see ``add_dialog_turns``.
+        self.ingest_concurrency = 1
         # The manager is the authority on the window size: make sure the store
         # enforces exactly the same bound (they are configured independently).
         self.store.recent_window_turns = self.recent_window_turns
@@ -419,11 +423,7 @@ class MemoryManager:
         """
         record, stats = self._prepare_turn(user_input, agent_output)
         gen = self._generate_only(record)
-        new_summary = self._apply_generated(gen, stats)
-        if new_summary is not None:
-            stats.new_summary_id = new_summary.summary_id
-            stats.overridden_ids = list(new_summary.override_ids)
-            stats.event_triggered = bool(new_summary.override_ids)
+        self._apply_generated(gen, stats)
         self._after_turn(stats)
         return stats
 
@@ -472,14 +472,10 @@ class MemoryManager:
         # record / window entry behind (the fallback would then double-write it).
         record, stats = self._prepare_turn(user_input, agent_output)
         gen["record"] = record
-        new_summary = self._apply_generated(gen, stats)
+        self._apply_generated(gen, stats)
         # The block was validated before we touched the store, so the summary is
         # stored either way; ``new_summary`` is None only if the apply step failed.
         stats.self_written = bool(gen.get("text"))
-        if new_summary is not None:
-            stats.new_summary_id = new_summary.summary_id
-            stats.overridden_ids = list(new_summary.override_ids)
-            stats.event_triggered = bool(new_summary.override_ids)
         self._after_turn(stats)
         return stats
 
@@ -635,6 +631,7 @@ class MemoryManager:
             fact_keys=gen.get("fact_keys") or sorted(extract_fact_keys(gen["text"])),
         )
         self.store.add_active_summary(new_summary, episode_id=self.episode_id)
+        archived_ids: List[str] = []
         for overridden_id in override_ids:
             old = self.store.remove_active_summary(overridden_id, episode_id=self.episode_id)
             if old is None:
@@ -647,6 +644,15 @@ class MemoryManager:
                 episode_id=self.episode_id,
             )
             self.overrides += 1
+            archived_ids.append(overridden_id)
+        # Bookkeeping lives here, not in the callers: the sequential, batch and
+        # self-write paths all funnel through this method, and when the batch path
+        # kept its own copy the two metrics disagreed within a single run
+        # (``overrides_events`` read 0 while ``overridden_summaries`` read 1).
+        # Counting *archived* ids (not requested ones) keeps the two consistent.
+        stats.new_summary_id = new_summary.summary_id
+        stats.overridden_ids = archived_ids
+        stats.event_triggered = bool(archived_ids)
         return new_summary
 
     def add_dialog_turns(self, turns: Sequence[tuple]) -> List[MemoryTurnStats]:
@@ -654,22 +660,31 @@ class MemoryManager:
         Ingest several turns; the manager decides between sequential and windowed
         concurrent summarisation.
 
-        **Ordering contract** (this is what a first concurrent version got wrong):
-        a turn's summary must be generated against the chain that already contains
-        every *earlier* turn of this episode.  Writing all raw records first and then
-        generating all summaries in parallel left every prompt with an empty
-        ``<ACTIVE_CHAIN>``, so the model had nothing to compare against and the
-        override mechanism silently never fired.
+        **Ordering contract**: with ``ingest_concurrency == 1`` (the default) a
+        turn's summary is generated against the chain that already contains every
+        *earlier* turn of this episode -- exactly the sequential semantics.  A first
+        concurrent version wrote all raw records first and then generated every
+        summary in parallel, leaving each prompt with an empty ``<ACTIVE_CHAIN>``;
+        the model had nothing to compare against and the override mechanism
+        silently never fired.
 
-        Sequential mode is exactly the old behaviour.  Concurrent mode runs a
-        *bounded window*: generate for turns ``[i, i+W)`` in parallel (they share the
-        same chain snapshot), apply them in order, then move the window forward.
-        Override detection therefore always sees the correct chain, and the resulting
-        memory is identical to sequential mode -- only the wall clock differs.
+        **Concurrency > 1 is an approximation, not an equivalent speedup.**  The
+        window generates turns ``[i, i+W)`` in parallel against one shared chain
+        snapshot, so a turn cannot override another turn *inside its own window*.
+        The result is therefore close to, but not identical with, sequential mode:
+        overrides whose target was created in the same window are lost.  Window 1
+        is the only semantics-preserving setting; the flag is kept for wall-clock
+        experiments that accept the difference.
         """
         concurrency = self.ingest_concurrency
         if concurrency <= 1 or self.summarizer is None:
             return [self.add_dialog_turn(u, a) for u, a in turns]
+        logger.warning(
+            "batch ingestion with concurrency=%d: turns inside one window are "
+            "summarised against a shared chain snapshot, so overrides within a "
+            "window cannot be detected (results are NOT identical to sequential)",
+            concurrency,
+        )
 
         turns = list(turns)
         window = max(2, int(concurrency))

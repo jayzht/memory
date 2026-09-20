@@ -818,7 +818,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tool-iterations", type=int, default=config.MAX_TOOL_ITERATIONS)
     parser.add_argument("--ingest-concurrency", type=int, default=config.INGEST_CONCURRENCY,
                         help="concurrent summariser calls while ingesting a dialogue "
-                             "(1 = sequential; concurrency does not change the resulting memory)")
+                             "(1 = sequential and semantics-preserving; >1 is an "
+                             "approximation: turns inside one window share a chain "
+                             "snapshot, so overrides within a window are missed)")
     parser.add_argument(
         "--chain-strategy",
         default=config.CHAIN_STRATEGY,
