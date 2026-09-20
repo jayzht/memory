@@ -23,7 +23,13 @@ from unittest import mock
 
 _HERE = Path(__file__).resolve()
 _ROOT = _HERE.parents[2]
-sys.path.insert(0, str(_HERE.parents[1] / "src"))
+# Same guard as the core suite: fall back to the source tree only when the package
+# is not installed, so release CI tests the wheel it just built rather than the
+# checkout it was built from.
+try:
+    import memory3l_mcp  # noqa: F401
+except ModuleNotFoundError:
+    sys.path.insert(0, str(_HERE.parents[1] / "src"))
 os.environ.setdefault("MEMORY3L_ROOT", str(_ROOT))
 
 try:

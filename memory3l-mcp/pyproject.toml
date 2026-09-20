@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memory3l-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Auditable three-layer memory over MCP: an append-only fact ledger and verifiable invariants I1-I5, served read-only from SQLite"
 readme = "README.md"
 requires-python = ">=3.10"

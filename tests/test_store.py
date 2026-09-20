@@ -19,7 +19,13 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Only when `memory3l` is not installed -- see the same guard in test_core.py: an
+# unconditional insert would shadow the wheel that release CI installs, and the
+# suite would test the checkout instead of the artifact.
+try:
+    import memory3l  # noqa: F401
+except ModuleNotFoundError:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from memory3l.models import ActiveSummary, ArchivedSummary, IndexEntry, RawDialogRecord
 from memory3l.store import InMemoryStore, SQLiteColdStore

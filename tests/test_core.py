@@ -15,11 +15,17 @@ import sys
 import tempfile
 import unittest
 
-# The repository root, so `memory3l` resolves when this file is run directly...
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# ...and this directory, so the sibling `test_store` import (FakeRedis) resolves
-# under `python -m unittest tests.test_core`.  Discovery puts this directory on the
-# path by itself, which is why the gap only shows up when running one module.
+# The repository root, so `memory3l` resolves when running from a checkout.  The
+# insertion is deliberately conditional: release CI installs the built wheel first,
+# and an unconditional insert would put the source tree ahead of it on sys.path, so
+# the suite would pass while testing the checkout rather than the artifact.
+try:
+    import memory3l  # noqa: F401
+except ModuleNotFoundError:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# This directory, so the sibling `test_store` import (FakeRedis) resolves under
+# `python -m unittest tests.test_core`.  Discovery puts this directory on the path
+# by itself, which is why the gap only shows up when running one module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from memory3l.dataset import build_synthetic_episodes, HISTORY_FACT

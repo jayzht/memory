@@ -51,19 +51,38 @@ jobs:
         working-directory: memory3l-mcp
         run: uv build --out-dir ../dist
 
-      # The tests need no network, no Redis and no model, so a broken release fails
-      # here rather than after the upload.
-      - name: Test memory3l
+      # One virtualenv holding both built wheels, so the local core wheel satisfies
+      # the MCP package's `memory3l` dependency instead of reaching for PyPI.
+      - name: Install the built wheels
         run: |
           uv venv .venv-ci
-          uv pip install --python .venv-ci/bin/python dist-core/*.whl
-          .venv-ci/bin/python -m unittest discover -s tests
+          uv pip install --python .venv-ci/bin/python dist-core/*.whl dist/*.whl
 
-      - name: Test memory3l-mcp
+      # Behavioural suite. It runs from the checkout because it also covers the
+      # repo-level harness scripts (`evaluation`, `audit_server`), which are
+      # deliberately not packaged -- and running from the checkout means the source
+      # tree is on sys.path, so this does NOT exercise the built wheels. That gap
+      # is what the artifact checks below exist to close.
+      - name: Test (source checkout)
+        run: .venv-ci/bin/python -m unittest discover -s tests
+
+      # Artifact checks. Run from a directory outside the checkout so the source
+      # tree cannot shadow the install; both then exercise the built wheels.
+      - name: Test the installed MCP package
         run: |
-          uv pip install --python .venv-ci/bin/python dist/*.whl
-          MEMORY3L_ROOT=$PWD PYTHONPATH=$PWD/memory3l-mcp/src \
-            .venv-ci/bin/python -m unittest discover -s memory3l-mcp/tests
+          mkdir -p /tmp/artifact-check
+          cd /tmp/artifact-check
+          $GITHUB_WORKSPACE/.venv-ci/bin/python -m unittest discover -s $GITHUB_WORKSPACE/memory3l-mcp/tests
+
+      # The regression test for packaging defects: importing the installed core
+      # requires every module it depends on to actually be in the wheel. The unit
+      # suite cannot see this class of bug by construction -- the real one
+      # (a root-level `config.py` imported from inside the package) passed all 109
+      # tests while the wheel failed to import anywhere else.
+      - name: Verify the installed distributions work outside the checkout
+        run: |
+          cd /tmp/artifact-check
+          $GITHUB_WORKSPACE/.venv-ci/bin/python $GITHUB_WORKSPACE/scripts/check_installed_package.py --checkout $GITHUB_WORKSPACE
 
       - name: Validate the MCP Registry metadata against the official schema
         run: |
