@@ -1,0 +1,118 @@
+# Publish both packages to PyPI without a stored credential.
+#
+# Why trusted publishing rather than an API token
+# -----------------------------------------------
+# An API token is a long-lived secret with write access to the release: it can
+# leak through a shell history, a log, a chat transcript or a compromised runner,
+# and it stays dangerous until someone remembers to revoke it. Trusted publishing
+# replaces it with a short-lived OIDC token that PyPI issues to this exact
+# repository, workflow file and environment, so there is nothing to steal and
+# nothing to rotate.
+#
+# One-time setup on PyPI (Account settings -> Publishing) -- for BOTH projects:
+#   memory3l        owner=jayzht  repository=<this repo>  workflow=publish.yml  environment=pypi-memory3l
+#   memory3l-mcp    owner=jayzht  repository=<this repo>  workflow=publish.yml  environment=pypi-memory3l-mcp
+# The environment names must match the `environment:` keys below exactly.
+#
+# Release: `git tag v0.1.1 && git push --tags`
+#
+# Note the two-package layout: `memory3l` builds from the repository root and
+# `memory3l-mcp` from its own subdirectory. They version independently -- the MCP
+# wrapper is younger than the core it wraps -- so each is published by its own job
+# and only when its own version is new.
+
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Which package to publish
+        type: choice
+        options: [both, memory3l, memory3l-mcp]
+        default: both
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # `uv build` in the repository root produces the core; the MCP package builds
+      # from its own directory because it has its own pyproject.toml and a src/ layout.
+      - name: Build memory3l
+        run: uv build --out-dir dist-core
+
+      - name: Build memory3l-mcp
+        working-directory: memory3l-mcp
+        run: uv build --out-dir ../dist
+
+      # The tests need no network, no Redis and no model, so a broken release fails
+      # here rather than after the upload.
+      - name: Test memory3l
+        run: |
+          uv venv .venv-ci
+          uv pip install --python .venv-ci/bin/python dist-core/*.whl
+          .venv-ci/bin/python -m unittest discover -s tests
+
+      - name: Test memory3l-mcp
+        run: |
+          uv pip install --python .venv-ci/bin/python dist/*.whl
+          MEMORY3L_ROOT=$PWD PYTHONPATH=$PWD/memory3l-mcp/src \
+            .venv-ci/bin/python -m unittest discover -s memory3l-mcp/tests
+
+      - name: Validate the MCP Registry metadata against the official schema
+        run: |
+          uv pip install --python .venv-ci/bin/python jsonschema
+          .venv-ci/bin/python - <<'PY'
+          import json, urllib.request
+          from jsonschema import Draft202012Validator
+          schema = json.loads(urllib.request.urlopen(
+              "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json").read())
+          document = json.load(open("memory3l-mcp/server.json"))
+          errors = list(Draft202012Validator(schema).iter_errors(document))
+          if errors:
+              raise SystemExit("\n".join(f"{list(e.path)}: {e.message}" for e in errors))
+          print("server.json is valid")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: |
+            dist/*
+            dist-core/*
+
+  publish-memory3l:
+    needs: build
+    if: github.event_name == 'push' || inputs.package == 'both' || inputs.package == 'memory3l'
+    runs-on: ubuntu-latest
+    environment: pypi-memory3l
+    permissions:
+      id-token: write # the OIDC token PyPI exchanges for a one-shot upload credential
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-core
+
+  publish-memory3l-mcp:
+    needs: build
+    if: github.event_name == 'push' || inputs.package == 'both' || inputs.package == 'memory3l-mcp'
+    runs-on: ubuntu-latest
+    environment: pypi-memory3l-mcp
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
