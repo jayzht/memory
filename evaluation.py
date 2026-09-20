@@ -252,19 +252,19 @@ def build_llms(args: argparse.Namespace) -> Tuple[BaseLLM, BaseLLM, Optional[Bas
 
     summarizer_backend = config.SUMMARIZER_BACKEND or backend
     summarizer_model = config.SUMMARIZER_MODEL_NAME or model
-    if (summarizer_backend, summarizer_model) == (backend, model):
-        summarizer_llm = agent_llm
-    else:
-        summarizer_llm = build_llm(summarizer_backend, summarizer_model, args.temperature)
+    # Deliberately a *separate client* even when the configuration is identical.
+    # Sharing one object made ``stats()`` a single counter read twice, so the
+    # metadata reported summarizer calls == total calls (490/490 with equal
+    # token counts) and the summariser/answer split -- the whole point of the
+    # cost discussion -- was unrecoverable.
+    summarizer_llm = build_llm(summarizer_backend, summarizer_model, args.temperature)
 
-    # Judge: reuse the agent model by default (same-family judging is the usual
+    # Judge: reuse the agent *model* by default (same-family judging is the usual
     # protocol in memory benchmarks); JUDGE_MODEL_NAME/JUDGE_BACKEND can override.
+    # A separate client keeps judge cost out of the answer counters.
     judge_llm: Optional[BaseLLM] = None
     if args.judge == "llm" or (args.judge == "auto" and backend != "heuristic"):
-        if config.JUDGE_MODEL_NAME and config.JUDGE_MODEL_NAME != model:
-            judge_llm = build_llm(backend, config.JUDGE_MODEL_NAME, 0.0)
-        else:
-            judge_llm = agent_llm
+        judge_llm = build_llm(backend, config.JUDGE_MODEL_NAME or model, 0.0)
     return agent_llm, summarizer_llm, judge_llm
 
 
@@ -363,6 +363,67 @@ class EpisodeResult:
                 row[key] = value
         return row
 
+    @classmethod
+    def from_payload(cls, row: Dict[str, Any]) -> "EpisodeResult":
+        """
+        Rebuild a result row from a checkpoint payload.
+
+        A resumed run must aggregate the *whole* run, not just the episodes this
+        process happened to execute -- otherwise the printed table and
+        ``metrics.csv`` quietly describe a subset (and the first flush truncates
+        ``predictions.csv`` down to that subset).
+        """
+        def _num(key: str, cast=float, default=0):
+            value = row.get(key, default)
+            if value in ("", None):
+                return default
+            try:
+                return cast(value)
+            except (TypeError, ValueError):
+                return default
+
+        text_mean = row.get("active_chain_text_tokens_mean")
+        result = cls(
+            run_id=str(row.get("run_id", "")),
+            system=str(row.get("system", "")),
+            episode_id=str(row.get("episode_id", "")),
+            scoped_id=str(row.get("scoped_id", "")),
+            store_backend=str(row.get("store_backend", "")),
+            llm_backend=str(row.get("llm_backend", "")),
+            model=str(row.get("model", "")),
+            num_turns=_num("num_turns", int),
+            num_probes=_num("num_probes", int),
+            current_total=_num("current_total", int),
+            current_correct=_num("current_correct", int),
+            history_total=_num("history_total", int),
+            history_correct=_num("history_correct", int),
+            other_total=_num("other_total", int),
+            other_correct=_num("other_correct", int),
+            tool_attempted=_num("tool_attempted", int),
+            tool_parsed=_num("tool_parsed", int),
+            tool_resolved=_num("tool_resolved", int),
+            tool_failed=_num("tool_failed", int),
+            active_chain_tokens_mean=_num("active_chain_tokens_mean", float),
+            active_chain_text_tokens_mean=(
+                None if text_mean in ("", None) else float(text_mean)
+            ),
+            active_chain_tokens_final=_num("active_chain_tokens_final", int),
+            active_chain_size_final=_num("active_chain_size_final", int),
+            archived_final=_num("archived_final", int),
+            overrides_events=_num("overrides_events", int),
+            capacity_compressions=_num("capacity_compressions", int),
+            prompt_tokens=_num("prompt_tokens", int),
+            completion_tokens=_num("completion_tokens", int),
+            wall_time_s=_num("wall_time_s", float),
+            error=str(row.get("error", "") or ""),
+        )
+        # Anything the row carries beyond the modelled fields (e.g.
+        # summarizer_failures, index_count) is preserved so the resumed
+        # predictions.csv keeps the same columns.
+        base_keys = set(result.to_row())
+        result.extra = {k: v for k, v in row.items() if k not in base_keys}
+        return result
+
 
 @dataclass
 class ProbeRecord:
@@ -404,9 +465,35 @@ class ProbeRecord:
             "tool_resolved": self.tool_resolved,
             "tool_unparsable": self.tool_unparsable,
             "context_tokens": self.context_tokens,
+            "answer_chars": self.answer_chars,
             "latency_ms": round(self.latency_ms, 1),
             "error": self.error[:200],
         }
+
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> "ProbeRecord":
+        """Inverse of :meth:`to_row`, so a resumed run keeps its probe rows."""
+        return cls(
+            run_id=str(row.get("run_id", "")),
+            system=str(row.get("system", "")),
+            episode_id=str(row.get("episode_id", "")),
+            probe_index=int(row.get("probe_index", 0) or 0),
+            probe_type=str(row.get("probe_type", "")),
+            fact_key=str(row.get("fact_key", "")),
+            question=str(row.get("question", "")),
+            gold=str(row.get("gold", "")),
+            prediction=str(row.get("prediction", "")),
+            correct=bool(row.get("correct", 0)),
+            judge_method=str(row.get("judge_method", "")),
+            judge_reason=str(row.get("judge_reason", "")),
+            tool_attempted=int(row.get("tool_attempted", 0) or 0),
+            tool_resolved=int(row.get("tool_resolved", 0) or 0),
+            tool_unparsable=int(row.get("tool_unparsable", 0) or 0),
+            context_tokens=int(row.get("context_tokens", 0) or 0),
+            answer_chars=int(row.get("answer_chars", 0) or 0),
+            latency_ms=float(row.get("latency_ms", 0.0) or 0.0),
+            error=str(row.get("error", "") or ""),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -505,6 +592,18 @@ def run_episode(
 
     # --- isolation: wipe this episode's hot memory before anything else ------ #
     agent.reset_episode(scoped)
+    # The namespace is ``system/episode`` and carries no run id, so a re-run
+    # (--force, or a new run id over the same SQLite file) would otherwise inherit
+    # archived summaries from the previous attempt.  Raw records are never touched.
+    clear_archive = getattr(getattr(agent, "store", None), "clear_archive", None)
+    if callable(clear_archive):
+        try:
+            stale = clear_archive(scoped)
+        except Exception as exc:  # noqa: BLE001 - isolation must not kill the episode
+            logger.warning("could not clear the archive for %s: %s", scoped, exc)
+        else:
+            if stale:
+                logger.info("cleared %d stale archived summary(ies) for %s", stale, scoped)
 
     turn_stats: List[Dict[str, Any]] = []
     try:
@@ -988,15 +1087,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     episode_logs: List[Dict[str, Any]] = []
     skipped = 0
     failed = 0
-    first_write_done = False
 
     try:
         for system in systems:
             done = set()
+            checkpoints: Dict[str, Dict[str, Any]] = {}
             if cold is not None and not args.no_checkpoint and not args.force:
                 done = cold.get_done_episodes(run_id=f"{run_id}::{system}")
                 if done:
                     logger.info("[%s] resuming: %d episode(s) already done, skipping", system, len(done))
+                    # Load their stored payloads so aggregation still covers the
+                    # whole run instead of only the episodes this process ran.
+                    for checkpoint in cold.list_run_payloads(run_id=run_id):
+                        if checkpoint["system_name"] == system:
+                            checkpoints[checkpoint["episode_id"]] = checkpoint["payload"]
 
             agent = build_agent(
                 system,
@@ -1027,6 +1131,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 scoped = scoped_episode_id(system, episode.episode_id)
                 if scoped in done:
                     skipped += 1
+                    payload = checkpoints.get(scoped)
+                    if payload:
+                        all_rows.append(EpisodeResult.from_payload(payload))
+                        for probe_row in payload.get("_probes") or []:
+                            try:
+                                all_probes.append(ProbeRecord.from_row(probe_row))
+                            except Exception:  # noqa: BLE001 - a bad stored row is not fatal
+                                logger.debug("skipping unreadable stored probe row in %s", scoped)
+                    else:
+                        logger.warning(
+                            "%s is checkpointed as done but has no stored payload; it will "
+                            "be missing from this run's aggregate", scoped,
+                        )
                     continue
                 log_prefix = f"[{system}] episode {index + 1}/{len(episodes)} {episode.episode_id}"
                 logger.info("%s (%d turns, %d probes)", log_prefix, episode.num_turns, len(episode.probes))
@@ -1050,13 +1167,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 all_rows.append(result)
                 all_probes.extend(probes)
                 episode_logs.append(episode_log)
+                chain_display = (
+                    "n/a" if result.active_chain_text_tokens_mean in (None, "")
+                    else f"{result.active_chain_text_tokens_mean:.0f}"
+                )
                 print(
                     f"  {log_prefix}: cur={result.current_correct}/{result.current_total} "
                     f"hist={result.history_correct}/{result.history_total} "
-                    f"chain={result.active_chain_text_tokens_mean:.0f}tok arch={result.archived_final} "
+                    f"chain={chain_display}tok arch={result.archived_final} "
                     f"tools={result.tool_resolved}/{result.tool_attempted} {result.wall_time_s:.1f}s"
                 )
                 if cold is not None and not args.no_checkpoint:
+                    # Payload first, done-flag second: a crash in between would
+                    # otherwise leave an episode marked done with no payload, and a
+                    # resume would aggregate a run that silently misses it.
+                    cold.save_run_payload(
+                        run_id, system, scoped,
+                        {**result.to_row(), "_probes": [p.to_row() for p in probes]},
+                    )
                     cold.mark_episode_done(
                         scoped,
                         run_id=f"{run_id}::{system}",
@@ -1070,16 +1198,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             ensure_ascii=False,
                         ),
                     )
-                    cold.save_run_payload(run_id, system, scoped, result.to_row())
 
-            # flush after each system so an interruption keeps completed work
+            # flush after each system so an interruption keeps completed work.
+            # ``append=False``: ``all_rows`` is cumulative, so appending it again on
+            # the next system duplicated every earlier row (4 systems x n episodes
+            # produced 10n rows with weights 4:3:2:1), and the analysis then read a
+            # differently-weighted mixture from predictions.csv.
             if all_rows:
-                write_csv(predictions_csv, [r.to_row() for r in all_rows], append=first_write_done)
+                write_csv(predictions_csv, [r.to_row() for r in all_rows])
                 write_csv(metrics_csv, aggregate(all_rows))
                 with open(episode_log_path, "w", encoding="utf-8") as handle:
                     for entry in episode_logs:
                         handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
-                first_write_done = True
     finally:
         store.close()
 

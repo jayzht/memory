@@ -122,6 +122,10 @@ class RedisSQLiteHybridStore(BaseMemoryStore):
         self.reset(episode_id=episode_id)
         self.cold.drop_episode(episode_id, keep_archive=False)
 
+    def clear_archive(self, episode_id: str) -> int:
+        """Drop this episode's archived summaries; raw records are permanent."""
+        return self.cold.clear_archive(self._ep(episode_id))
+
     def rebuild_hot_state(self, episode_id: Optional[str] = None) -> bool:
         """Restore active chain + window into Redis from the SQLite mirrors."""
         episode = self._ep(episode_id)

@@ -253,6 +253,19 @@ class BaseMemoryStore(abc.ABC):
     def count_archived_summaries(self, episode_id: Optional[str] = None) -> int:
         return len(self.list_archived_summaries(episode_id))
 
+    def clear_archive(self, episode_id: str) -> int:
+        """
+        Delete one episode's archived summaries, returning how many were removed.
+
+        Raw records are **never** touched -- they are permanent by contract.  This
+        exists because the archive namespace is ``<system>/<episode>`` and carries no
+        run id: re-running an episode (``--force``, or a new run id over the same
+        SQLite file) would otherwise inherit dead rows from the previous run, which
+        inflates ``Avg_Archived`` and feeds stale summaries into the memory-point
+        probes.  Batch evaluation calls this once, before ingestion starts.
+        """
+        raise NotImplementedError
+
     def find_archived_summary(self, summary_id: str) -> Optional[ArchivedSummary]:
         """Global exact-id search, used by the archival tool across episode scopes."""
         return self.get_archived_summary(summary_id, episode_id=None)
@@ -413,6 +426,13 @@ class InMemoryStore(BaseMemoryStore):
         if limit is not None:
             items = items[-limit:]
         return items
+
+    def clear_archive(self, episode_id: str) -> int:
+        episode = self._ep(episode_id)
+        doomed = [sid for sid, item in self._archived.items() if item.episode_id == episode]
+        for summary_id in doomed:
+            self._archived.pop(summary_id, None)
+        return len(doomed)
 
     # -- window ------------------------------------------------------------- #
     def append_window_record(self, record: RawDialogRecord, episode_id: Optional[str] = None) -> List[RawDialogRecord]:

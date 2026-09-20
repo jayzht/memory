@@ -520,6 +520,11 @@ class SQLiteColdStore:
         self.execute("DELETE FROM active_summaries WHERE episode_id=?", (episode_id,))
         self.execute("DELETE FROM index_entries WHERE episode_id=?", (episode_id,))
 
+    def clear_archive(self, episode_id: str) -> int:
+        """Drop this episode's archived summaries; raw records stay (permanent)."""
+        cursor = self.execute("DELETE FROM archived_summaries WHERE episode_id=?", (episode_id,))
+        return int(cursor.rowcount or 0)
+
     # ------------------------------------------------------------------ #
     # sliding window mirror (crash recovery only)
     # ------------------------------------------------------------------ #
