@@ -52,12 +52,14 @@ No network, no API key, no Redis.
 
 ## Tools
 
-Read-only. `append_facts` appears only with `--allow-write` or
-`MEMORY3L_ALLOW_WRITE=1`.
+**Read-only by default.** Without `--allow-write` (or `MEMORY3L_ALLOW_WRITE=1`) the
+server is an audit surface: it can inspect memory but not create it.
 
 | Tool | Answers |
 | --- | --- |
-| `store_info` | which database is served, and whether it is readable |
+| `memory_context` | the memory block to put in your prompt — call before answering |
+| `remember` | record a completed turn — call after answering |
+| `store_info` | which database is served, whether it is readable, and whether memory is on |
 | `list_episodes` | which episode ids exist — call this first |
 | `audit` | the invariant report for one episode |
 | `audit_summary` | the same, aggregated over every episode |
@@ -67,6 +69,37 @@ Read-only. `append_facts` appears only with `--allow-write` or
 | `evidence` | the original dialogue a fact was extracted from |
 | `tombstones` | what was erased, what is provably gone, what prose remains |
 | `temporal` | the versioned projection, its anomalies, and its DDL |
+| `append_facts` | intake for your own extractor; it cannot make a fact *visible* |
+
+### Giving an agent memory
+
+The memory half is two calls per turn, and the order matters:
+
+```
+memory_context(episode_id)                       # before you answer
+remember(episode_id, user_message, agent_message) # after you answer
+```
+
+`memory_context` returns memory in a fixed order (recent dialogue, current values,
+index titles, summary chain) with no persona attached, so it drops into any prompt.
+An empty block is the correct answer for a new conversation.
+
+**MCP has no hook, so nothing is automatic**: if you skip `memory_context` the
+agent answers without memory even though `remember` recorded the turns. The
+[`memory3l` skill](#the-skill) is what teaches an agent to make both calls.
+
+Two operational notes:
+
+- **`remember` is where the model call goes.** It summarises, so each turn costs a
+  summariser call. Point `--summarizer` at a small model.
+- **The conversation survives a restart.** One `episode_id` is one conversation;
+  the chain and the turn counter are read back from SQLite, so a restarted server
+  continues rather than starting over.
+
+Without a model (`--summarizer none`) memory still works — turns are stored verbatim
+— but nothing is extracted, so the current-value registry stays empty and the audit
+tools have nothing to check. `store_info` reports which mode you are in rather than
+letting the difference be discovered later.
 
 ### The invariants
 
@@ -110,7 +143,7 @@ the ambient environment, which is why the ledger path is set explicitly here).
 
 ## The skill
 
-`skills/memory-audit/SKILL.md` is an [Agent Skills](https://agentskills.io/specification)
+`skills/memory3l/SKILL.md` is an [Agent Skills](https://agentskills.io/specification)
 bundle that teaches an agent *when* to reach for these tools and how to report the
 answer without overstating it — chiefly that "no violations" is not a guarantee
 that nothing was lost.
@@ -118,7 +151,7 @@ that nothing was lost.
 Install it into the cross-client directory so every compliant agent sees it:
 
 ```bash
-memory3l-mcp-install-skill           # → ~/.agents/skills/memory-audit
+memory3l-mcp-install-skill           # → ~/.agents/skills/memory3l
 ```
 
 Skills installed there are visible to any client that scans `.agents/skills/`,

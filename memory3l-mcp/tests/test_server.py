@@ -150,6 +150,111 @@ class AnswerTest(unittest.TestCase):
         self.assertIn("CREATE TABLE", temporal["ddl"])
 
 
+class MemoryToolsTest(unittest.TestCase):
+    """
+    The write side: what lets an agent *have* memory rather than only audit it.
+
+    ``summarizer_choice="heuristic"`` keeps these offline. It is a rule-based
+    stand-in, but it does produce real fact keys, so the ledger and the
+    current-value registry are exercised for real instead of being empty.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "ledger.db"
+        self.mcp = build_server(self.db, allow_write=True, summarizer_choice="heuristic")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _remember(self, episode, user, agent="好的", mcp=None):
+        return _call(mcp or self.mcp, "remember",
+                     {"episode_id": episode, "user_message": user, "agent_message": agent})
+
+    def test_write_tools_appear_only_with_allow_write(self) -> None:
+        read_only = {t.name for t in asyncio.run(build_server(self.db).list_tools())}
+        self.assertNotIn("remember", read_only)
+        self.assertNotIn("memory_context", read_only)
+        writable = {t.name for t in asyncio.run(self.mcp.list_tools())}
+        self.assertEqual(writable - read_only, {"remember", "memory_context", "append_facts"})
+
+    def test_remember_creates_an_episode_and_memory_context_reads_it_back(self) -> None:
+        """A brand-new episode is the normal first call, not an unknown-episode error."""
+        stats = self._remember("chat/1", "你好，跟你说一下，我的工位楼层是3楼。")
+        self.assertEqual(stats["turn_index"], 0)
+        self.assertTrue(stats["summarised"])
+
+        context = _call(self.mcp, "memory_context", {"episode_id": "chat/1"})
+        self.assertIn("工位楼层=3楼", context["current_values"])
+        self.assertIn("<ACTIVE_SUMMARY_CHAIN>", context["memory_block"])
+        self.assertIn("<RECENT_RAW_DIALOGUE>", context["memory_block"])
+
+    def test_an_override_replaces_the_value_and_keeps_the_old_one(self) -> None:
+        episode = "chat/2"
+        self._remember(episode, "你好，跟你说一下，我的工位楼层是3楼。")
+        stats = self._remember(episode, "对了，我的工位楼层改成7楼了。")
+        self.assertEqual(len(stats["overridden"]), 1, "the earlier summary must be overridden")
+
+        self.assertIn("工位楼层=7楼", _call(self.mcp, "memory_context", {"episode_id": episode})["current_values"])
+        history = _call(self.mcp, "history", {"episode_id": episode, "slot": "工位楼层"})["history"]
+        self.assertEqual([row["value"] for row in history], ["3楼", "7楼"])
+
+    def test_memory_survives_a_restart_without_reusing_turn_numbers(self) -> None:
+        """
+        A fresh server on the same file must continue the conversation.
+
+        This is the property that makes a long-lived server usable at all, and it
+        depends on two things at once: reading the chain back from SQLite (no reset)
+        and restoring the turn counter (resume). Without the second, the numbering
+        restarts at 0 and a repeated exchange can collide on the same raw id.
+        """
+        episode = "chat/3"
+        self._remember(episode, "你好，跟你说一下，我的工位楼层是3楼。")
+        self._remember(episode, "对了，我的工位楼层改成7楼了。")
+
+        restarted = build_server(self.db, allow_write=True, summarizer_choice="heuristic")
+        self.assertIn("工位楼层=7楼",
+                      _call(restarted, "memory_context", {"episode_id": episode})["current_values"])
+        stats = self._remember(episode, "对了，我的工位楼层改成12楼了。", mcp=restarted)
+        self.assertEqual(stats["turn_index"], 2, "turn numbering must continue, not restart at 0")
+
+        turns = sorted(r.turn_index for r in SQLiteColdStore(str(self.db)).list_raw_records(episode))
+        self.assertEqual(turns, [0, 1, 2], "raw turn indices must stay unique")
+
+    def test_verbatim_mode_still_remembers_and_says_what_is_lost(self) -> None:
+        """No model configured is a supported state, not a broken one -- but not a silent one."""
+        mcp = build_server(self.db, allow_write=True, summarizer_choice="none")
+        info = _call(mcp, "store_info", {})
+        self.assertEqual(info["summariser"], "verbatim")
+        self.assertIn("none", info["summariser_note"])
+
+        self._remember("chat/4", "我的城市是北京。", mcp=mcp)
+        context = _call(mcp, "memory_context", {"episode_id": "chat/4"})
+        self.assertEqual(context["window_turns"], 1, "the turn is remembered")
+        self.assertEqual(context["current_values"], "", "no extraction without a model")
+
+    def test_store_info_reports_whether_memory_is_available(self) -> None:
+        info = _call(self.mcp, "store_info", {})
+        self.assertTrue(info["memory_tools"])
+        self.assertEqual(info["summariser"], "configured")
+        self.assertFalse(_call(build_server(self.db), "store_info", {})["memory_tools"])
+
+    def test_remember_requires_a_user_message(self) -> None:
+        result = _call(self.mcp, "remember",
+                       {"episode_id": "chat/5", "user_message": "   ", "agent_message": "x"})
+        self.assertEqual(result["error"], "user_message is required")
+
+    def test_blank_episode_is_rejected_by_the_memory_tools(self) -> None:
+        self.assertEqual(_call(self.mcp, "memory_context", {"episode_id": ""})["error"],
+                         "episode_id is required")
+
+    def test_memory_context_on_an_empty_episode_is_not_an_error(self) -> None:
+        """It is what every first turn sees; erroring here would break the normal flow."""
+        context = _call(self.mcp, "memory_context", {"episode_id": "chat/never-used"})
+        self.assertEqual(context["window_turns"], 0)
+        self.assertIn("<ACTIVE_SUMMARY_CHAIN>", context["memory_block"])
+
+
 class FailureModeTest(unittest.TestCase):
     """
     The failure modes matter more than the happy path here.

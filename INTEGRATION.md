@@ -5,23 +5,23 @@
 
 ---
 
-## 一、先分清两件事
+## 一、两条路，选一条
 
-这套东西有两个**可以独立使用**的面，很多人会混淆：
+同一套东西有两种用法，都能让 agent 有记忆，区别是**你要不要改代码**：
 
-| | 作用 | 你需要什么 |
-|---|---|---|
-| **记忆本体**（`memory3l` 库） | 让 agent **有记忆**：维护三层、生成 prompt 上下文 | 一个 store + 一个摘要 LLM |
-| **审计面**（`memory3l-mcp` / sidecar） | 检查记忆**有没有丢东西** | 一个已存在的台账文件 |
+| | 怎么用 | 要改代码吗 | 自动程度 |
+|---|---|---|---|
+| **A. 库**（`memory3l`，第二节） | 你的循环里调四次 | 要，约四行 | 完全自动 |
+| **B. MCP 插件**（`memory3l-mcp`，第五节） | 起个 MCP 服务，agent 每轮调两个工具 | 不要，改配置 | 靠 agent 自觉调用 |
+| **C. 审计面**（`memory3l-mcp` 只读模式） | 指向一个已存在的台账文件 | 不要 | — |
 
-关键点：**审计面不能单独使用**。它读的是 `fact_ledger` 表，而那张表只有记忆本体写入时才会产生。所以：
+**先讲清楚一个容易混的地方**：C 和 B 是**同一个服务**的两种模式。默认只读（C）时它只能**查**记忆，不能产生记忆；加上 `--allow-write`（B）它才暴露 `remember`/`memory_context`，agent 才真正能**有**记忆。
 
-- 你要"给 agent 加记忆" → 走第一节（库）
-- 你要"验证记忆可信 / 让别人审我的记忆" → 走第二节（MCP），但它依赖第一节先跑起来
+要"验证记忆可信 / 让别人审我的记忆"，用 C 就够；要"让另一个 agent 用上这套记忆"，得用 B。
 
 ---
 
-## 二、给 agent 加记忆：四次调用
+## 二、路线 A：库，四次调用
 
 整个接入就是一个循环：
 
@@ -104,12 +104,12 @@ print(report["ok"], report["violations"])
 
 ---
 
-## 五、让另一个 agent 来审（MCP）
+## 五、不写代码的用法：让任何 MCP agent 有记忆（MCP）
 
-同一个 SQLite 文件就是 `memory3l-mcp` 的服务对象：
+第二节那四行是**库**的用法，需要你改自己的循环。如果你不想动代码，同一个 SQLite 文件也可以用 MCP 服务起来，让 agent 通过工具调用来记忆——**这才是"装个插件就能用"的那条路**：
 
 ```bash
-uvx memory3l-mcp --db agent_memory.db
+uvx memory3l-mcp --db agent_memory.db --allow-write
 ```
 
 在 DSH 的 `$DSH_HOME/profiles/<name>/cordis.patch.yml` 里加一行：
@@ -122,17 +122,45 @@ uvx memory3l-mcp --db agent_memory.db
         serverName: memory
         transport: stdio
         command: uvx
-        args: ['memory3l-mcp']
+        args: ['memory3l-mcp', '--db', '/absolute/path/to/agent_memory.db', '--allow-write']
         env:
-          MEMORY3L_DB: /absolute/path/to/agent_memory.db
+          DEEPSEEK_API_KEY: !!js process.env.DEEPSEEK_API_KEY   # 摘要器要用的模型
 ```
 
-工具会以 `mcp__memory__audit`、`mcp__memory__current`、`mcp__memory__history` 等名字出现。默认**只读**；`append_facts`（给自建抽取器用的幂等写入）需要 `--allow-write` 才注册。
+工具会以 `mcp__memory__remember`、`mcp__memory__memory_context`、`mcp__memory__audit` 等名字出现。
 
-配套技能（教 agent *何时*用这些工具、以及如何不过度声称）：
+### 然后 agent 每轮调两次
+
+```
+答之前：memory_context(episode_id)                  → 取回记忆块，放进它自己的 prompt
+答之后：remember(episode_id, user_message, answer)   → 记录这一轮
+```
+
+**必须说清楚的一点：MCP 没有钩子，所以没有任何东西是自动的。** 你不调 `memory_context`，agent 就是在无记忆的情况下回答问题——哪怕 `remember` 已经记下了前面所有轮次。让 agent 知道要去调这两个工具，靠的是技能：
+
 ```bash
-memory3l-mcp-install-skill      # → ~/.agents/skills/memory-audit
+memory3l-mcp-install-skill      # → ~/.agents/skills/memory3l
 ```
+
+技能教它：回合循环的顺序、哪个问题该用哪个工具、以及**如何不过度声称**（"没有违规"不等于"没丢数据"）。
+
+### 三个操作要点
+
+| | |
+|---|---|
+| **摘要器每轮都要调模型** | 这是 `remember` 里的开销，`--summarizer` 指个小模型 |
+| **重启不失忆** | 一个 `episode_id` = 一段对话；链和轮次计数都从 SQLite 读回，新的 server 进程接着往下走 |
+| **没有模型也能跑** | `--summarizer none` 时原话进链，记忆仍可用，但没有事实抽取 → 登记表为空、审计无内容。`store_info` 会**明确报告**当前是哪种模式 |
+
+`--allow-write` 是必须的：不加它就是纯审计面（只读），拿不到 `remember`。这是刻意的默认——写记忆是特权操作。
+
+**库 vs MCP，怎么选：**
+
+| | 库（第二节） | MCP（这一节） |
+|---|---|---|
+| 要改代码 | 是，四行包住你的循环 | 否，改配置 + 让 agent 调工具 |
+| 自动程度 | 完全自动 | 每轮两次工具调用，靠 agent 自觉 |
+| 跨 agent | 只服务你写的那一个 | 任何 MCP client 共用一份记忆 |
 
 ---
 
@@ -143,7 +171,7 @@ memory3l-mcp-install-skill      # → ~/.agents/skills/memory-audit
 | 不做 | 意味着 |
 |---|---|
 | 向量检索 / 语义搜索 | 不能"找找跟这个问题相关的记忆"。进 prompt 的是摘要链和当前值表 |
-| 全自动接入 | 你必须改 prompt 构造方式（第二节第 1 步），不能只在 SDK 外面包一层 |
+| **MCP 上的自动接入** | MCP 没有钩子，agent 必须**每轮主动调** `memory_context`/`remember`。要完全自动只能走路线 A（库） |
 | 抽取正确性保证 | 抽错了它不知道；只有"漏抽"被 I4 覆盖 |
 | 多租户 / 配额 | 做 SaaS 才需要，现在没有 |
 | 按主体加密删除 | 现在是"删原文 + 墓碑"，对静态磁盘的历史备份无效 |

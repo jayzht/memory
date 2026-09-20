@@ -240,7 +240,7 @@ MEMORY3L_ROOT=$PWD PYTHONPATH=$PWD/memory3l-mcp/src \
 |---|---|
 | `memory3l/service.py` | `AuditService`：审计面的唯一实现，sidecar 与 MCP **共用**，避免两种传输给出不同结论 |
 | `memory3l-mcp/` | PyPI 包：`MCPServer`（stdio）、自管存储路径、10 个工具 |
-| `memory3l-mcp/skills/memory-audit/SKILL.md` | 跨 agent 技能：何时用哪个工具、以及**如何不过度声称** |
+| `memory3l-mcp/skills/memory3l/SKILL.md` | 跨 agent 技能：记忆的回合循环（`remember`/`memory_context`）+ 审计纪律 |
 | `memory3l-mcp/server.json` | MCP Registry 元数据（`registryType: pypi`、`runtimeHint: uvx`） |
 
 **已发布**（PyPI + MCP Registry）：
@@ -252,7 +252,7 @@ MEMORY3L_ROOT=$PWD PYTHONPATH=$PWD/memory3l-mcp/src \
 
 ```bash
 uvx memory3l-mcp                                  # 无需仓库、无需 MEMORY3L_ROOT
-memory3l-mcp-install-skill                        # → ~/.agents/skills/memory-audit
+memory3l-mcp-install-skill                        # → ~/.agents/skills/memory3l
 curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.jayzht/memory3l-mcp"
 ```
 
@@ -262,7 +262,7 @@ Registry 的所有权校验靠 **PyPI 上的 README** 含 `mcp-name:` 标记并�
 
 ```bash
 uvx memory3l-mcp                                  # 无需仓库、无需 MEMORY3L_ROOT
-memory3l-mcp-install-skill                        # → ~/.agents/skills/memory-audit
+memory3l-mcp-install-skill                        # → ~/.agents/skills/memory3l
 ```
 
 验证方式：从 PyPI 全新装（干净 venv，仓库不在 `sys.path`）→ stdio 握手 10 个工具 → `store_info` / `list_episodes` / `audit` 全部返回正确结果。

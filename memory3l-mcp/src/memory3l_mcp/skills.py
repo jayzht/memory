@@ -30,7 +30,7 @@ from typing import Sequence
 __all__ = ["BUNDLED_SKILL_DIR", "DEFAULT_SKILL", "install_skill", "main"]
 
 BUNDLED_SKILL_DIR = Path(__file__).resolve().parent / "skills"
-DEFAULT_SKILL = "memory-audit"
+DEFAULT_SKILL = "memory3l"
 
 
 def _skills_root() -> Path:
@@ -91,7 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="memory3l-mcp-install-skill",
         description=(
-            "Install the memory-audit Agent Skill into the cross-client skills "
+            "Install the memory3l Agent Skill into the cross-client skills "
             "directory so every compliant agent can see it."
         ),
     )

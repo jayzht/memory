@@ -82,7 +82,97 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
-def build_server(db_path: Path, allow_write: bool = False):
+# Which backends cannot work without a credential, and which variable supplies it.
+_KEY_FOR_BACKEND = {
+    "deepseek": "DEEPSEEK_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openai_compatible": "OPENAI_API_KEY",
+    "vllm": "OPENAI_API_KEY",
+    "compatible": "OPENAI_API_KEY",
+}
+
+
+def _build_summarizer(choice: str | None):
+    """
+    Resolve the summariser, or ``(None, reason)`` for verbatim mode.
+
+    ``auto`` uses the configured backend but refuses one whose key is missing.
+    That matters because constructing ``DeepSeekLLM`` without a key does not fail
+    until the first call -- so choosing it blindly would turn every ``remember``
+    into a late, confusing error instead of an honest "memory is running
+    uncompressed".  A missing key is a supported configuration, not a fault: the
+    manager stores the verbatim turn as the summary, so the three layers still work;
+    what is lost is compression and fact extraction, and therefore the ledger and
+    everything the audit tools report.
+    """
+    from memory3l import config
+    from memory3l.llm import build_llm
+
+    if (choice or "").lower() == "none":
+        return None, "verbatim mode requested (--summarizer none)"
+
+    resolved = (choice or "auto").lower()
+    if resolved == "auto":
+        resolved = config.LLM_BACKEND
+    required = _KEY_FOR_BACKEND.get(resolved)
+    if required and not os.environ.get(required):
+        return None, f"{resolved} needs {required}, which is not set"
+    try:
+        return build_llm(resolved), None
+    except Exception as error:  # noqa: BLE001 - reported, not fatal
+        return None, f"{resolved} could not be constructed: {type(error).__name__}: {error}"
+
+
+class EpisodePool:
+    """
+    One ``MemoryManager`` per episode, kept alive for the life of the server.
+
+    A manager is bound to a single episode and holds the working state (the chain
+    position, the window). Creating one per call would reset that state every time,
+    so they are cached.
+
+    ``reset_on_bind=False, resume=True`` is the load-bearing pair. Not resetting
+    keeps the persisted chain: a fresh manager reads the active summaries back out
+    of SQLite, so a restarted server continues the same conversation instead of
+    silently starting over. ``resume=True`` restores the *turn counter* from the
+    persisted raw records -- without it the numbering restarts at 0 and a repeated
+    exchange can collide on the same raw reference id.
+    """
+
+    def __init__(self, store, summarizer, *, recent_window_turns: int,
+                 active_chain_token_limit: int):
+        self._store = store
+        self._summarizer = summarizer
+        self._recent_window_turns = recent_window_turns
+        self._active_chain_token_limit = active_chain_token_limit
+        self._managers: dict[str, Any] = {}
+
+    def get(self, episode_id: str):
+        from memory3l.memory_manager import MemoryManager
+
+        manager = self._managers.get(episode_id)
+        if manager is None:
+            manager = MemoryManager(
+                self._store,
+                self._summarizer,
+                episode_id=episode_id,
+                recent_window_turns=self._recent_window_turns,
+                active_chain_token_limit=self._active_chain_token_limit,
+                reset_on_bind=False,
+                resume=True,
+            )
+            manager.debug = False
+            self._managers[episode_id] = manager
+        return manager
+
+
+def build_server(
+    db_path: Path,
+    allow_write: bool = False,
+    summarizer_choice: str | None = None,
+    recent_window_turns: int = 4,
+    active_chain_token_limit: int = 800,
+):
     """
     Construct the MCP server with its tools registered.
 
@@ -91,6 +181,10 @@ def build_server(db_path: Path, allow_write: bool = False):
     does *not* stop the server: the tools still register and each one returns the
     reason it cannot answer.  A server that refuses to start would leave the user
     with no tool list and no diagnosis.
+
+    ``allow_write`` controls two different things and they are both writes, so they
+    share the gate: ``remember`` (maintain the memory) and ``append_facts`` (intake
+    for a caller's own extractor). Without it the server is purely an audit surface.
     """
     ensure_memory3l()
 
@@ -145,6 +239,31 @@ def build_server(db_path: Path, allow_write: bool = False):
             )
         return None
 
+    def _guard_write(episode_id: str) -> str | None:
+        """
+        Precondition for the memory tools.
+
+        Deliberately *not* :func:`_guard`: recording the first turn of a new
+        conversation is the normal case, so an episode that does not exist yet must
+        be accepted. Only a missing ledger or an empty id is an error here.
+        """
+        if service is None:
+            return _error("ledger unavailable", path=str(db_path), detail=open_error)
+        if not (episode_id or "").strip():
+            return _error(
+                "episode_id is required",
+                hint="one stable id per conversation, e.g. 'chat/user-42'",
+            )
+        return None
+
+    summarizer, summarizer_note = _build_summarizer(summarizer_choice)
+    pool = (
+        EpisodePool(service.store, summarizer,
+                    recent_window_turns=recent_window_turns,
+                    active_chain_token_limit=active_chain_token_limit)
+        if service is not None else None
+    )
+
     mcp = MCPServer(
         name=SERVER_NAME,
         title="Auditable memory (memory3l)",
@@ -176,6 +295,13 @@ def build_server(db_path: Path, allow_write: bool = False):
             "readable": active is not None,
             "detail": failure,
             "writes_enabled": allow_write,
+            # Whether the agent can *have* memory or only audit it is the first thing
+            # worth knowing about a running server, and a silent verbatim fallback is
+            # the kind of thing that is discovered weeks later.
+            "memory_tools": allow_write,
+            "summariser": ("configured" if summarizer is not None else "verbatim")
+            if allow_write else None,
+            **({"summariser_note": summarizer_note} if allow_write and summarizer_note else {}),
             "configured_by": (
                 f"{DB_ENV}" if os.environ.get(DB_ENV)
                 else f"{DEFAULT_DIR_ENV}" if os.environ.get(DEFAULT_DIR_ENV)
@@ -384,6 +510,92 @@ def build_server(db_path: Path, allow_write: bool = False):
             return _error("temporal projection failed", episode_id=episode_id,
                           detail=f"{type(error).__name__}: {error}")
 
+    # -------------------------------------------------- memory (write side) --
+    # These are what let an agent *have* memory rather than only inspect it. They
+    # are gated with `append_facts` because both write; without --allow-write the
+    # server is purely an audit surface.
+    if allow_write:
+        @mcp.tool(
+            title="Get the memory block to put in your prompt",
+            description=(
+                "Return this conversation's memory as a text block, ready to insert "
+                "into your own prompt before answering. Call it at the start of every "
+                "turn, BEFORE you answer.\n\n"
+                "The block is fixed in this order: recent raw dialogue, the current-value "
+                "registry, index-layer titles, then the active summary chain. It contains "
+                "no persona or instructions, so it composes with any agent prompt.\n\n"
+                "An empty block is the correct answer for a new conversation -- it is not "
+                "an error. If you skip this call you are answering without memory even "
+                "though earlier turns were recorded with `remember`."
+            ),
+        )
+        def memory_context(episode_id: str) -> str:
+            blocked = _guard_write(episode_id)
+            if blocked:
+                return blocked
+            try:
+                from memory3l.prompts import build_memory_block
+
+                manager = pool.get(episode_id.strip())
+                window = manager.get_window()
+                chain = manager.chain_summaries()
+                registry = manager.render_current_values()
+                block = build_memory_block(
+                    window, chain, manager.rendered_index_entries(), current_values=registry
+                )
+            except Exception as error:  # noqa: BLE001
+                return _error("cannot read memory", episode_id=episode_id,
+                              detail=f"{type(error).__name__}: {error}")
+            return _json({
+                "episode_id": episode_id.strip(),
+                "memory_block": block,
+                "current_values": registry,
+                "window_turns": len(window),
+                "chain_summaries": len(chain),
+                "summariser": "configured" if summarizer is not None else "verbatim",
+                **({"summariser_note": summarizer_note} if summarizer_note else {}),
+            })
+
+        @mcp.tool(
+            title="Record a turn into memory",
+            description=(
+                "Record one completed exchange, maintaining all three layers. Call it "
+                "at the end of every turn, AFTER you answer.\n\n"
+                "This is the only way memory grows: `append_facts` cannot do it, because "
+                "the current-value registry is derived from the summaries' own fact keys. "
+                "Summarisation happens here, so this call is where the paid model call "
+                "goes -- and where an overridden value is archived rather than dropped.\n\n"
+                "`episode_id` is one conversation. Reuse the same id to continue it, "
+                "including after this server restarts: the chain and the turn counter are "
+                "restored from the database. Use a new id for an unrelated conversation."
+            ),
+        )
+        def remember(episode_id: str, user_message: str, agent_message: str) -> str:
+            blocked = _guard_write(episode_id)
+            if blocked:
+                return blocked
+            if not (user_message or "").strip():
+                return _error("user_message is required",
+                              hint="record the user's actual message, not a summary of it")
+            try:
+                manager = pool.get(episode_id.strip())
+                stats = manager.add_dialog_turn(user_message, agent_message or "")
+                registry = manager.render_current_values()
+            except Exception as error:  # noqa: BLE001
+                return _error("remember failed", episode_id=episode_id,
+                              detail=f"{type(error).__name__}: {error}")
+            return _json({
+                "episode_id": episode_id.strip(),
+                "turn_index": stats.turn_index,
+                "window_turns": stats.window_size,
+                "summarised": not stats.summariser_skipped,
+                "new_summary_id": stats.new_summary_id or None,
+                "overridden": list(stats.overridden_ids),
+                "chain_summaries": stats.active_chain_size,
+                "current_values": registry,
+                **({"summariser_note": summarizer_note} if summarizer_note else {}),
+            })
+
     # ------------------------------------------------------- optional write --
     if allow_write:
         @mcp.tool(
@@ -434,7 +646,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--allow-write",
         action="store_true",
-        help=f"also expose the append_facts tool (same as {WRITE_ENV}=1)",
+        help=(
+            "also expose the writing tools: `remember` (maintain memory) and "
+            f"`append_facts` (fact intake). Same as {WRITE_ENV}=1. Without it the "
+            "server is an audit surface only"
+        ),
+    )
+    parser.add_argument(
+        "--summarizer",
+        default=os.environ.get("MEMORY3L_SUMMARIZER", "auto"),
+        metavar="BACKEND",
+        help=(
+            "model that compresses turns into summaries: auto (default, from "
+            "LLM_BACKEND/the available API key), none (store turns verbatim -- no "
+            "compression, no fact extraction, so the audit tools find nothing), or "
+            "deepseek/openai/ollama/heuristic"
+        ),
+    )
+    parser.add_argument(
+        "--recent-window-turns",
+        type=int,
+        default=int(os.environ.get("MEMORY3L_RECENT_WINDOW_TURNS", "4")),
+        help="verbatim turns kept in the sliding window (default 4)",
+    )
+    parser.add_argument(
+        "--active-chain-token-limit",
+        type=int,
+        default=int(os.environ.get("MEMORY3L_ACTIVE_CHAIN_TOKEN_LIMIT", "800")),
+        help="token budget for the active summary chain before it is compressed (default 800)",
     )
     parser.add_argument(
         "--log-level",
@@ -456,7 +695,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     db_path = resolve_db_path(args.db)
 
     try:
-        mcp = build_server(db_path, allow_write=allow_write)
+        mcp = build_server(
+            db_path,
+            allow_write=allow_write,
+            summarizer_choice=args.summarizer,
+            recent_window_turns=args.recent_window_turns,
+            active_chain_token_limit=args.active_chain_token_limit,
+        )
     except MemoryCoreNotFound as error:
         print(error, file=sys.stderr)
         return 2

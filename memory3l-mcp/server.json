@@ -3,13 +3,13 @@
   "name": "io.github.jayzht/memory3l-mcp",
   "title": "Auditable memory (memory3l)",
   "description": "Audited memory over MCP: an append-only fact ledger plus verifiable invariants I1-I5.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "memory3l-mcp",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

@@ -86,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     # wheel built without it would break `memory3l-mcp-install-skill` for anyone
     # who only ever ran `uvx`.
     from memory3l_mcp.skills import BUNDLED_SKILL_DIR, install_skill
-    skill = BUNDLED_SKILL_DIR / "memory-audit" / "SKILL.md"
+    skill = BUNDLED_SKILL_DIR / "memory3l" / "SKILL.md"
     if not skill.is_file():
         raise SystemExit(f"the bundled skill is missing from the wheel: {skill}")
     print(f"bundled skill present: {skill.relative_to(BUNDLED_SKILL_DIR.parent)}")
