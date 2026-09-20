@@ -44,4 +44,4 @@ packages = ["src/memory3l_mcp"]
 "skills" = "memory3l_mcp/skills"
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "skills", "README.md", "server.json", "scripts"]
+include = ["src", "skills", "README.md", "server.json", "scripts", "LICENSE"]
