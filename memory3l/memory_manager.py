@@ -1718,6 +1718,23 @@ class MemoryManager:
         )
         return report
 
+    def current(self, slot: str) -> Optional[Dict[str, Any]]:
+        """What is this slot's value now, and where did it come from?"""
+        record = self.fact_ledger.current(slot)
+        if record is None:
+            return None
+        return {
+            "slot": record.slot,
+            "value": record.value,
+            "fact_id": record.fact_id,
+            "since_turn": record.observed_turn,
+            "evidence": list(record.evidence),
+        }
+
+    def history(self, slot: str, upto_turn: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Every value this slot held, oldest first (the temporal-store shape)."""
+        return self.fact_ledger.history(slot, upto_turn=upto_turn)
+
     def explain_fact(self, fact_id: str) -> Dict[str, Any]:
         """Why is this fact not in the working set any more, and who replaced it?"""
         record = self.fact_ledger.get(fact_id)

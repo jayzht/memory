@@ -326,6 +326,42 @@ class FactLedger:
             current[record.slot] = record
         return current
 
+    def current(self, slot: str) -> Optional[FactRecord]:
+        """The newest surviving observation of ``slot`` (erased facts do not count)."""
+        slot = (slot or "").strip().lower()
+        for record in reversed(self._records):      # appended in creation order
+            if record.slot == slot and not record.erased:
+                return record
+        return None
+
+    def history(self, slot: str, upto_turn: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Every value ``slot`` ever held, oldest first, as closed intervals.
+
+        This is the shape a system-versioned table stores, so a customer can answer
+        the same questions from their own temporal store -- see
+        :mod:`memory3l.temporal` for the equivalence contract.
+        """
+        slot = (slot or "").strip().lower()
+        rows = [r for r in self._records if r.slot == slot]
+        rows.sort(key=lambda r: (r.observed_turn, r.seq))
+        if upto_turn is not None:
+            rows = [r for r in rows if r.observed_turn <= upto_turn]
+        out: List[Dict[str, Any]] = []
+        for index, record in enumerate(rows):
+            following = rows[index + 1] if index + 1 < len(rows) else None
+            out.append({
+                "slot": record.slot,
+                "value": record.value,               # "" once erased
+                "fact_id": record.fact_id,
+                "from_turn": record.observed_turn,
+                "to_turn": following.observed_turn if following else None,
+                "superseded_by": following.fact_id if following else "",
+                "reason": record.reason,
+                "erased": record.erased,
+            })
+        return out
+
     def stats(self) -> Dict[str, Any]:
         return {
             "ledger_facts": len(self._records),

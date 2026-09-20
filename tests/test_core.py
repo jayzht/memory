@@ -855,6 +855,93 @@ class TestExtractionCompleteness(unittest.TestCase):
         self.assertTrue(any(v.startswith("I4:") for v in report.violations), report.violations)
 
 
+class TestTemporalProjection(unittest.TestCase):
+    """
+    Outsourcing storage needs a contract, not an implementation.
+
+    The ledger is projected into a flat, system-versioned table and the two promised
+    queries are answered from that projection alone -- so equality with the ledger is
+    an assertion about the mapping, not a tautology.
+    """
+
+    @staticmethod
+    def _ledger():
+        from memory3l.dataset import build_long_context_episodes
+
+        episode = build_long_context_episodes(
+            num_episodes=1, turns_per_episode=30, seed=777, language="zh"
+        )[0]
+        manager = MemoryManager(InMemoryStore(recent_window_turns=4), HeuristicLLM(),
+                                episode_id="ep_temporal", active_chain_token_limit=400,
+                                reset_on_bind=True)
+        for user, reply in episode.dialogues:
+            manager.add_dialog_turn(user, reply)
+        return manager.fact_ledger
+
+    def test_projection_answers_the_contract_identically(self):
+        from memory3l.temporal import TemporalFactTable
+
+        ledger = self._ledger()
+        table = TemporalFactTable.from_ledger(ledger)
+        self.assertTrue(table.rows())
+        self.assertEqual(table.anomalies(), [])
+
+        slots = sorted(ledger.slots())
+        self.assertTrue(slots)
+        for slot in slots:
+            self.assertEqual(
+                table.history(slot), ledger.history(slot), f"history mismatch for {slot}"
+            )
+            for upto in (5, 12, 20):
+                self.assertEqual(
+                    table.history(slot, upto_turn=upto),
+                    ledger.history(slot, upto_turn=upto),
+                    f"as-of mismatch for {slot}@{upto}",
+                )
+            expected = ledger.current(slot)
+            actual = table.current(slot)
+            self.assertEqual(
+                expected.value if expected else None,
+                actual.value if actual else None,
+                f"current mismatch for {slot}",
+            )
+
+    def test_an_erased_fact_is_an_empty_interval(self):
+        """History must show that the value *was* there and is now gone."""
+        from memory3l.temporal import TemporalFactTable
+
+        ledger = self._ledger()
+        target = next(r for r in ledger.entries() if r.slot)
+        ledger.erase([target.fact_id], reason="gdpr")
+        table = TemporalFactTable.from_ledger(ledger)
+        history = table.history(target.slot)
+        self.assertTrue(any(row["erased"] and row["value"] == "" for row in history), history)
+        self.assertEqual(table.anomalies(), [])
+
+    def test_anomalies_catch_a_corrupt_projection(self):
+        from memory3l.temporal import TemporalFactTable, TemporalRow
+
+        ledger = self._ledger()
+        table = TemporalFactTable.from_ledger(ledger)
+        slot = sorted(ledger.slots())[0]
+        # A second open row and an overlap: the two classic ways a versioned table rots.
+        table._rows.append(TemporalRow(episode_id="ep_temporal", slot=slot, value="bogus",
+                                       fact_id="bogus", valid_from_turn=5, valid_to_turn=99))
+        table._rows.append(TemporalRow(episode_id="ep_temporal", slot=slot, value="bogus2",
+                                       fact_id="bogus2", valid_from_turn=6, valid_to_turn=None))
+        anomalies = table.anomalies()
+        self.assertTrue(any("open intervals" in item for item in anomalies), anomalies)
+        self.assertTrue(any("overlap" in item for item in anomalies), anomalies)
+
+    def test_ddl_documents_the_two_contract_queries(self):
+        from memory3l.temporal import TemporalFactTable
+
+        ddl = TemporalFactTable.ddl()
+        self.assertIn("valid_to_turn IS NULL", ddl)
+        self.assertIn("valid_from_turn <= :t", ddl)
+        self.assertIn("UNIQUE INDEX", ddl)
+
+
 class TestComplianceErasure(unittest.TestCase):
     """
     Compliance erasure is the one operation that overrides "raw is never deleted", so
@@ -1198,6 +1285,17 @@ class TestAuditSidecar(unittest.TestCase):
             self.assertEqual(payload["tombstones"][0]["reason"], "gdpr")
             self.assertEqual(payload["tombstones"][0]["value"], "")
             self.assertEqual(payload["tombstones"][0]["evidence_still_readable"], [])
+
+            quoted_episode = urllib.parse.quote(episode_id, safe="")
+            quoted_slot = urllib.parse.quote("工位楼层", safe="")
+            status, payload = get(f"/history?episode={quoted_episode}&slot={quoted_slot}")
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["history"])
+
+            status, payload = get(f"/temporal?episode={urllib.parse.quote(episode_id, safe='')}")
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["consistent"], payload["anomalies"])
+            self.assertGreater(payload["rows"], 0)
         finally:
             httpd.shutdown()
             httpd.server_close()          # release the listening socket

@@ -18,6 +18,8 @@ Endpoints (all GET, all require ``?token=``):
     GET /fact?fact_id=<id>                        why a fact left the working set
     GET /fact/evidence?fact_id=<id>               the original dialogue it came from
     GET /tombstones?episode=<id>                  compliance erasures (what is gone)
+    GET /history?episode=<id>&slot=<slot>         every value the slot held
+    GET /temporal?episode=<id>                    the versioned projection + anomalies
 
 **Use the query-parameter form.** A ``fact_id`` is
 ``<episode>/<kind><seq>@<hash>#<slot>`` and contains ``#``, which in a URL starts
@@ -48,6 +50,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from memory3l.audit import FactLedger, audit_episode, derive_current_values  # noqa: E402
+from memory3l.temporal import TemporalFactTable  # noqa: E402
 from memory3l.store.sqlite_store import SQLiteColdStore  # noqa: E402
 
 logger = logging.getLogger("audit_server")
@@ -112,6 +115,33 @@ class AuditService:
                 "residual_prose_mentions": record.residual_mentions,
             })
         return {"episode_id": episode_id, "tombstones": rows}
+
+    def history(self, episode_id: str, slot: str, upto_turn=None):
+        """The slot's value over time -- the question a temporal store answers."""
+        table = TemporalFactTable.from_store(self.store, episode_id)
+        return {
+            "episode_id": episode_id,
+            "slot": slot.strip().lower(),
+            "upto_turn": upto_turn,
+            "history": table.history(slot, upto_turn=upto_turn),
+        }
+
+    def temporal(self, episode_id: str):
+        """
+        The versioned projection and its consistency check.
+
+        Useful when storage is outsourced: the ledger is the reference, and this says
+        whether the projection still agrees with it.
+        """
+        table = TemporalFactTable.from_store(self.store, episode_id)
+        anomalies = table.anomalies()
+        return {
+            "episode_id": episode_id,
+            "rows": len(table.rows()),
+            "consistent": not anomalies,
+            "anomalies": anomalies,
+            "ddl": TemporalFactTable.ddl(),
+        }
 
     def fact(self, fact_id: str):
         ledger = self._ledger_for(fact_id)
@@ -236,6 +266,27 @@ def make_handler(service: AuditService, token: str):
                     return
                 self._send(service.tombstones(episode_id))
                 return
+            if path == "/history":
+                episode_id = (query.get("episode") or [""])[0]
+                slot = (query.get("slot") or [""])[0]
+                if not episode_id or not slot:
+                    self._send({"error": "missing ?episode=<id>&slot=<slot>"}, 400)
+                    return
+                raw_upto = (query.get("upto_turn") or [""])[0]
+                try:
+                    upto = int(raw_upto) if raw_upto else None
+                except ValueError:
+                    self._send({"error": "upto_turn must be an integer"}, 400)
+                    return
+                self._send(service.history(episode_id, slot, upto))
+                return
+            if path == "/temporal":
+                episode_id = (query.get("episode") or [""])[0]
+                if not episode_id:
+                    self._send({"error": "missing ?episode=<id>"}, 400)
+                    return
+                self._send(service.temporal(episode_id))
+                return
             if path.startswith("/fact/"):
                 rest = path[len("/fact/"):]
                 want_evidence = rest.endswith("/evidence")
@@ -279,6 +330,7 @@ def main() -> int:
     print(f"audit sidecar on http://{args.host}:{args.port}  (db={args.sqlite_path})")
     print(f"  GET /health | /episodes | /audit?episode=<id> | /current?episode=<id>")
     print(f"  GET /fact/<fact_id> | /fact/<fact_id>/evidence")
+    print(f"  GET /tombstones?episode=<id> | /history?episode=<id>&slot=<s> | /temporal?episode=<id>")
     print(f"  all requests need ?token={args.token}")
     try:
         httpd.serve_forever()
