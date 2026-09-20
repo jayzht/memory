@@ -162,6 +162,11 @@ class IndexEntry:
 
     index_id: str
     title: str
+    #: The LLM-written subject of the group, kept separately from the derived
+    #: ``属性=值`` digest so the title can be *recomputed* from the surviving members
+    #: (no LLM call) whenever a member is overridden or merged away.  Storing the
+    #: whole title made it go stale: the index still advertised the old value.
+    theme: str = ""
     members: List[str] = field(default_factory=list)
     span_start: float = 0.0
     span_end: float = 0.0
@@ -201,9 +206,17 @@ class IndexEntry:
         return f"turn {self.turn_start}-{self.turn_end}" if self.turn_start != self.turn_end else f"turn {self.turn_start}"
 
     def capped_title(self) -> str:
-        if len(self.title) <= self.MAX_TITLE_CHARS:
+        # The cap is a config knob: the digest is built from several attributes, and
+        # a hard 60 chars discarded most of it while the builder allowed 220.
+        try:
+            import config
+
+            limit = int(getattr(config, "INDEX_TITLE_CHARS", 0) or self.MAX_TITLE_CHARS)
+        except Exception:  # pragma: no cover - config is always importable in practice
+            limit = self.MAX_TITLE_CHARS
+        if len(self.title) <= limit:
             return self.title
-        return self.title[: self.MAX_TITLE_CHARS - 1] + "…"
+        return self.title[: max(1, limit - 1)] + "…"
 
     def render(self, preview: int = 1) -> str:
         """
@@ -213,7 +226,13 @@ class IndexEntry:
         (~10 tokens), not a full summary line (~100 tokens).  The hierarchy's whole
         point is that detail is fetched on demand, so the prompt must stay cheap.
         """
-        head = f"- {self.index_id} [INDEX {self.time_label()}, {self.size} entries] {self.capped_title()}"
+        head = f"- {self.index_id} [INDEX {self.time_label()}, {self.size} entries"
+        # The group count is rendered from ``child_index_ids`` rather than baked into
+        # the title: prefixing each fold put "[2 组] [2 组] [2 组]" in front of the
+        # digest, pushing the actual facts out of the truncated title.
+        if self.child_index_ids:
+            head += f", {len(self.child_index_ids)} groups"
+        head += f"] {self.capped_title()}"
         snippet_source = self.previews or self.member_summaries
         if preview > 0 and snippet_source:
             body = "\n".join(f"    · {line}" for line in snippet_source[:preview])
@@ -358,6 +377,8 @@ class MemoryTurnStats:
     super_index_ids: List[str] = field(default_factory=list)
     fact_safety_fallbacks: int = 0
     index_rejections: int = 0
+    #: index entries rewritten because a member left the active chain
+    index_updates: int = 0
     lazy_moved: int = 0
     lazy_summary_count: int = 0
     index_count: int = 0
@@ -365,6 +386,8 @@ class MemoryTurnStats:
     active_chain_size: int = 0
     active_chain_tokens: int = 0
     active_chain_text_tokens: int = 0
+    #: cost of the derived current-value registry rendered at the top of layer 1
+    current_values_tokens: int = 0
     window_size: int = 0
     archived_total: int = 0
     raw_total: int = 0

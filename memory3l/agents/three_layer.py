@@ -88,6 +88,9 @@ class ThreeLayerAgent(BaseAgent):
             # flag is threaded explicitly so the prompt can never advertise tools
             # the agent cannot run.
             tools_available=self.supports_tools(),
+            # Derived current-value registry: keeps every current value at the top
+            # level of the prompt regardless of how the summaries are filed.
+            current_values=self.manager.render_current_values(),
         )
 
     def answer_and_remember(self, question: str):
@@ -134,6 +137,11 @@ class ThreeLayerAgent(BaseAgent):
             metrics["avg_context_tokens"] = (
                 metrics["avg_active_chain_tokens_rendered"] + window_tokens
             )
+            # The derived current-value registry is part of the rendered prompt, so
+            # report its cost explicitly instead of burying it in the chain figure.
+            metrics["avg_current_values_tokens"] = sum(
+                s.current_values_tokens for s in self.manager.stats
+            ) / len(self.manager.stats)
             metrics["avg_all_rendered_tokens"] = sum(
                 estimate_tokens(s.render()) for s in self.manager.list_active_summaries()
             )

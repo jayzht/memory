@@ -150,6 +150,20 @@ INDEX_RENDER_RECENT: int = _env_int("INDEX_RENDER_RECENT", 2)
 # Hard cap on index entries built per turn (stability guard: without it a
 # mis-calibrated loop once produced 800 entries and 11k-token prompts).
 INDEX_MAX_PER_TURN: int = _env_int("INDEX_MAX_PER_TURN", 2)
+# --- current-value registry ------------------------------------------------ #
+# A small always-rendered block ``属性=最新值; ...`` derived from the live
+# summaries' fact_keys (no extra LLM call).  It exists because the *current* value
+# of an attribute used to be visible only if some index title happened to still
+# carry it -- and index titles truncate, go stale on override, and are recomputed
+# per group.  With the registry, "what is X now?" is answerable from the top level
+# of the prompt no matter how the summaries are filed.
+CURRENT_VALUES_ENABLED: bool = _env_bool("CURRENT_VALUES_ENABLED", True)
+# Hard cap on registry entries.  Recency wins when an episode has many slots.
+CURRENT_VALUES_MAX_SLOTS: int = _env_int("CURRENT_VALUES_MAX_SLOTS", 12)
+# Characters allowed for an index title *as rendered*.  The digest is built from
+# up to 6 attributes plus a theme, so a 60-char cap silently discarded most of it
+# (the built string was allowed 220).
+INDEX_TITLE_CHARS: int = _env_int("INDEX_TITLE_CHARS", 120)
 # How many summariser calls to run concurrently while ingesting a dialogue.
 # 0/1 = strictly sequential.  Concurrency changes only the wall clock: override
 # resolution stays sequential, so the resulting memory is identical.

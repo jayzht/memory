@@ -393,6 +393,86 @@ class TestIndexHierarchy(unittest.TestCase):
                     "the catalogue entry must still reach its raw dialogue",
                 )
 
+    def test_fact_digest_reports_the_newest_value_as_current(self):
+        """
+        The digest used to iterate newest-first, so ``seq[-1]`` -- labelled the
+        current value -- was the group's OLDEST value and the history read backwards.
+        """
+        from memory3l.models import ActiveSummary
+
+        members = [
+            ActiveSummary(summary_id=f"e/s{i}@x", text=f"工位={i}楼",
+                          fact_keys=[f"工位={i}楼"], seq=i, episode_id="e")
+            for i in (1, 2, 3)
+        ]
+        digest = MemoryManager._fact_digest(members)
+        self.assertEqual(digest, "工位=3楼[1楼→2楼→3楼]")
+        self.assertTrue(digest.startswith("工位=3楼"), digest)
+
+    def test_override_removes_the_member_from_its_index_entry(self):
+        """
+        An override must update the entry that pointed at the summary.
+
+        Before the fix the entry kept the archived member: ``N entries`` overstated
+        the group, ``expand_index`` returned fewer summaries than advertised, and the
+        preview/title still showed the superseded value.
+        """
+        manager, store = self._manager()
+        for index in range(10):
+            manager.add_dialog_turn(f"turn {index}", "ok")
+        entries = manager.list_index_entries()
+        entry = entries[0]
+        target = entry.members[0]
+        short = target.split("/")[-1].split("@")[0]
+
+        manager.summarizer = ScriptedLLM(
+            lambda messages: f"工位改到99楼\n[FACTS: 工位=99楼]\n[OVERRIDES: {short}]"
+        )
+        manager.add_dialog_turn("工位换了吗", "换成99楼了")
+
+        fresh = {e.index_id: e for e in manager.list_index_entries()}
+        if entry.index_id in fresh:
+            updated = fresh[entry.index_id]
+            self.assertNotIn(target, updated.members)
+            self.assertEqual(updated.size, len(manager.expand_index(updated.index_id)))
+        self.assertTrue(
+            sum(s.index_updates for s in manager.stats) >= 1,
+            "the override should have rewritten an index entry",
+        )
+
+    def test_current_values_registry_tracks_the_newest_value(self):
+        """
+        The registry is the top-level guarantee: the current value must be visible
+        without a tool call even when the summary that holds it is filed away.
+        """
+        manager, _ = self._manager()
+        for index in range(10):
+            manager.add_dialog_turn(f"turn {index}", "ok")
+
+        values = {slot: value for slot, value, _sid in manager.current_values()}
+        self.assertEqual(values.get("工位"), "3楼")
+        rendered = manager.render_current_values()
+        self.assertIn("工位=3楼", rendered)
+        # ...and it costs almost nothing
+        self.assertLess(len(rendered), 60)
+        # even though nothing holding that fact is rendered directly
+        self.assertTrue(manager.list_index_entries(), "expected the hierarchy to file summaries")
+
+    def test_lazy_summaries_are_not_rendered(self):
+        """A summary parked in the lazy store must not render (documented contract)."""
+        from memory3l.models import LAZY_INDEX_ID
+
+        manager, store = self._manager()
+        for index in range(8):
+            manager.add_dialog_turn(f"turn {index}", "ok")
+        actives = manager.list_active_summaries()
+        if not actives:
+            self.skipTest("no summaries")
+        actives[0].index_id = LAZY_INDEX_ID
+        store.add_active_summary(actives[0], episode_id="ep_idx")
+        rendered = {s.summary_id for s in manager.chain_summaries()}
+        self.assertNotIn(actives[0].summary_id, rendered)
+
 
 class TestHeuristicPipeline(unittest.TestCase):
     """End-to-end mechanics with the dependency-free backend."""

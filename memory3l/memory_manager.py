@@ -295,20 +295,21 @@ class MemoryManager:
         """
         The summaries actually rendered in the prompt.
 
-        A summary renders only when it is not referenced by any title.  Being
-        referenced is what makes it safe to stop rendering: the title above it is
-        the navigation handle, and its own id still resolves on demand via
-        ``get_archived_summary`` / ``expand_index``.
+        A summary renders only when no title points at it *and* it is not parked in
+        the lazy store.  Being reachable is what makes it safe to stop rendering:
+        a title (directly or through a super index) is the navigation handle, and
+        the id still resolves on demand via ``get_archived_summary`` /
+        ``expand_index``.
 
-        Whether a referenced summary also sits in the lazy store is therefore an
-        implementation detail -- both cases render nothing.
+        The lazy check used to be missing here, so a summary marked id-only was
+        still rendered -- the documented contract said otherwise.
         """
         title_members: set = set()
         for entry in self.list_index_entries():
             title_members.update(entry.members)
         return [
             s for s in self.store.list_active_summaries(self.episode_id)
-            if s.summary_id not in title_members
+            if s.summary_id not in title_members and s.index_id != LAZY_INDEX_ID
         ]
 
     def lazy_summaries(self) -> List[ActiveSummary]:
@@ -377,7 +378,48 @@ class MemoryManager:
         index_cost = sum(
             estimate_tokens(e.render(preview=depth)) for e, depth in self.rendered_index_entries()
         )
-        return chain_cost + index_cost
+        return chain_cost + index_cost + estimate_tokens(self.render_current_values())
+
+    # ------------------------------------------------------------------ #
+    # current-value registry: derived, always visible, never stale
+    # ------------------------------------------------------------------ #
+    def current_values(self, max_slots: Optional[int] = None) -> List[tuple]:
+        """
+        ``[(slot, value, summary_id), ...]`` -- the newest live summary per slot.
+
+        Derived from the summaries' stored ``fact_keys``, so it costs no LLM call and
+        cannot go stale: a summary that is overridden or merged away simply stops
+        contributing.  This is the top-level guarantee that "what is X now?" is
+        answerable without a tool call, which is where the real-data failure mode
+        was -- the value was only reachable from inside an index member.
+        """
+        if not getattr(config, "CURRENT_VALUES_ENABLED", True):
+            return []
+        limit = config.CURRENT_VALUES_MAX_SLOTS if max_slots is None else max_slots
+        latest: Dict[str, tuple] = {}
+        # Oldest -> newest, so a later turn's value overwrites an earlier one.
+        for summary in self.list_active_summaries():
+            for key in (summary.fact_keys or sorted(extract_fact_keys(summary.text))):
+                if "=" not in key:
+                    continue
+                slot = self._slot_of(key)
+                value = key.split("=", 1)[1].strip()
+                if slot and value:
+                    latest[slot] = (slot, value, summary.summary_id, summary.seq)
+        if not latest:
+            return []
+        # When the cap bites, keep the most recently updated slots; then restore a
+        # stable (chronological) display order so the block does not reshuffle.
+        ordered = sorted(latest.values(), key=lambda item: item[3], reverse=True)[: max(1, limit)]
+        ordered.sort(key=lambda item: item[3])
+        return [(slot, value, summary_id) for slot, value, summary_id, _ in ordered]
+
+    def render_current_values(self, max_slots: Optional[int] = None) -> str:
+        """One compact line, or ``""`` so the prompt omits the block entirely."""
+        items = self.current_values(max_slots)
+        if not items:
+            return ""
+        return "; ".join(f"{slot}={value}" for slot, value, _ in items)
 
     def active_chain_text_tokens(self) -> int:
         """Tokens of the rendered chain bodies only (the reported cost figure)."""
@@ -645,6 +687,9 @@ class MemoryManager:
             )
             self.overrides += 1
             archived_ids.append(overridden_id)
+        # An index is a pointer: keep it consistent with the chain it points into.
+        if archived_ids:
+            self._detach_from_indexes(archived_ids, stats)
         # Bookkeeping lives here, not in the callers: the sequential, batch and
         # self-write paths all funnel through this method, and when the batch path
         # kept its own copy the two metrics disagreed within a single run
@@ -966,23 +1011,27 @@ class MemoryManager:
 
     def _lazy_store_summaries(self, stats: MemoryTurnStats) -> int:
         """
-        Move non-rendered summaries to the lazy store (id-only, still fully readable).
+        Mark summaries that are two hops from the rendered layer as id-only.
 
-        Contract: a summary is either (a) rendered, (b) pointed at by a title, or
-        (c) lazily stored by id.  Lazy storage never touches a title's members, so
-        ``expand_index`` keeps returning the same set it returned before.
+        Contract: a summary is either (a) rendered, (b) pointed at by a live title,
+        or (c) marked id-only while remaining reachable through a title.  **A
+        summary with no title must never be hidden** -- there would be no pointer
+        to it in the prompt and no way for the model to ask for it, which is the
+        one genuinely unreachable state.  The previous version did exactly that
+        (``elif not summary.index_id``), and because ``chain_summaries`` ignored the
+        marker the bug stayed invisible.
         """
         active = self.store.list_active_summaries(self.episode_id)
         newest_keep = {x.summary_id for x in active[-max(1, self.index_render_recent):]}
         entries = self.list_index_entries()
-        # A title that has itself been folded into a super index is "covered": its
-        # members are two hops from the rendered layer, so they can stop rendering.
-        # This is the situation lazy storage exists for -- before a super index
-        # exists, every summary is either rendered or one hop from a title.
-        folded_titles = {cid for e in entries for cid in e.child_index_ids}
+        # Members of a super index are two hops from the rendered layer: the child
+        # title they used to hang from no longer exists, so mark them id-only.
+        # NOTE: read the members off the *live* super entry.  Deriving this from the
+        # children's ids cannot work -- folding deletes the children, so the old
+        # lookup always produced an empty set and the sweep never fired.
         covered_members: set = set()
         for entry in entries:
-            if entry.index_id in folded_titles:
+            if entry.child_index_ids:
                 covered_members.update(entry.members)
         moved = 0
         for summary in active:
@@ -991,12 +1040,6 @@ class MemoryManager:
             if summary.index_id == LAZY_INDEX_ID:
                 continue
             if summary.summary_id in covered_members:
-                # Keep the title membership for provenance, but mark id-only so the
-                # renderer and the diagnostics agree on its state.
-                summary.index_id = LAZY_INDEX_ID
-                self.store.add_active_summary(summary, episode_id=self.episode_id)
-                moved += 1
-            elif not summary.index_id:
                 summary.index_id = LAZY_INDEX_ID
                 self.store.add_active_summary(summary, episode_id=self.episode_id)
                 moved += 1
@@ -1064,8 +1107,10 @@ class MemoryManager:
 
         entry = IndexEntry(
             index_id=make_id(self.episode_id, "idx", self._next_seq(), salt=f"{title}|{turn_start}|{turn_end}"),
-            # (title is already capped by _make_index_title)
             title=title,
+            # The theme is stored separately so the digest half of the title can be
+            # recomputed from the survivors when a member is overridden or merged.
+            theme=theme,
             members=[x.summary_id for x in batch],
             span_start=min(x.timestamp for x in batch),
             span_end=max(x.timestamp for x in batch),
@@ -1123,10 +1168,17 @@ class MemoryManager:
         # A super index aggregates its children's attribute histories, so a value
         # that moved across group boundaries is still visible at the top level.
         child_digest = ManagerFactDigest.merge([e.title for e in reversed(list(group))], max_attrs=8)
-        title = (child_digest or f"{group[0].capped_title()[:24]} … {group[-1].capped_title()[:24]}")[:220]
+        theme = (
+            child_digest
+            or f"{group[0].capped_title()[:24]} … {group[-1].capped_title()[:24]}"
+        )[:220]
         super_entry = IndexEntry(
-            index_id=make_id(self.episode_id, "sidx", self._next_seq(), salt=title),
-            title=f"[{len(group)} 组] {title}",
+            index_id=make_id(self.episode_id, "sidx", self._next_seq(), salt=theme),
+            # No "[N 组]" prefix in the stored title: the count is rendered from
+            # ``child_index_ids``, so folding repeatedly no longer prepends
+            # "[2 组] [2 组] [2 组]" ahead of the facts.
+            title=theme,
+            theme=theme,
             members=[m for e in group for m in e.members],   # transitive, for expand
             child_index_ids=[e.index_id for e in group],
             span_start=min(e.span_start for e in group),
@@ -1164,6 +1216,79 @@ class MemoryManager:
                     stats.turn_index, len(group))
         return True
 
+    # ------------------------------------------------------------------ #
+    # index maintenance: an index is a pointer, so it must follow the chain
+    # ------------------------------------------------------------------ #
+    def _refresh_index_title(self, entry: IndexEntry, members: Sequence[ActiveSummary]) -> None:
+        """
+        Recompute an entry's ``属性=值`` digest from its *surviving* members.
+
+        No LLM call is needed: every summary already stores its ``fact_keys``.  The
+        stored title made the index advertise a value that had since been
+        overridden -- a stale "current value" sitting at the top level right next to
+        the fresh one.
+        """
+        digest = self._fact_digest(members) if members else ""
+        theme = getattr(entry, "theme", "") or ""
+        if digest and theme:
+            entry.title = f"{digest} ｜ {theme}"[:220]
+        elif digest:
+            entry.title = digest[:220]
+        elif theme:
+            entry.title = theme[:220]
+        entry.fact_keys = sorted({k for m in members for k in (m.fact_keys or extract_fact_keys(m.text))})
+
+    def _detach_from_indexes(
+        self, removed_ids: Sequence[str], stats: Optional[MemoryTurnStats] = None
+    ) -> int:
+        """
+        Take summaries that left layer 1 out of the index entries that listed them.
+
+        Overriding (or capacity-merging) a *filed* summary used to leave the entry
+        untouched: it still counted the dead member in ``N entries``, still rendered
+        its preview line, and still contributed its old value to the digest, while
+        ``expand_index`` returned fewer summaries than the entry claimed.  Returns
+        the number of entries updated.
+        """
+        removed = {summary_id for summary_id in removed_ids if summary_id}
+        if not removed:
+            return 0
+        live = {s.summary_id: s for s in self.list_active_summaries()}
+        touched = 0
+        for entry in list(self.list_index_entries()):
+            if not removed.intersection(entry.members):
+                continue
+            survivors = [mid for mid in entry.members if mid in live]
+            if len(survivors) < 2:
+                # A group of fewer than two is not a group.  Dissolve it and let the
+                # survivor render again (or be re-filed with later summaries) rather
+                # than leave a one-member "index" pointing at one summary.
+                self.store.remove_index_entry(entry.index_id, self.episode_id)
+                for member_id in survivors:
+                    summary = live.get(member_id)
+                    if summary is not None:
+                        summary.index_id = ""
+                        self.store.add_active_summary(summary, episode_id=self.episode_id)
+                touched += 1
+                continue
+            members = [live[mid] for mid in survivors]
+            entry.members = survivors
+            live_entries = {e.index_id for e in self.list_index_entries()}
+            entry.child_index_ids = [c for c in entry.child_index_ids if c in live_entries]
+            self._refresh_index_title(entry, members)
+            entry.previews = [_preview_snippet(m.text) for m in members[:3]]
+            entry.member_summaries = [m.render() for m in members[:3]]
+            self.store.add_index_entry(entry, episode_id=self.episode_id)
+            touched += 1
+        if touched:
+            logger.info(
+                "index maintenance at turn %s: %d entr%s updated after %d member(s) left the chain",
+                getattr(stats, "turn_index", "?"), touched, "y" if touched == 1 else "ies", len(removed),
+            )
+            if stats is not None:
+                stats.index_updates += touched
+        return touched
+
     @staticmethod
     def _fact_digest(members: Sequence[ActiveSummary], max_attrs: int = 6, max_history: int = 3) -> str:
         """
@@ -1178,9 +1303,24 @@ class MemoryManager:
         """
         order: List[str] = []
         values: Dict[str, List[str]] = {}
-        # Newest members first: when the title has to be truncated, the attributes
-        # that changed most recently are the ones an answer is most likely to need.
-        for summary in reversed(list(members)):
+        # Two orders are needed here and were previously conflated.  Attribute
+        # *order* favours the members that changed most recently, so the attributes
+        # an answer is most likely to need survive truncation.  Value *history* must
+        # run oldest -> newest, because ``seq[-1]`` is labelled the current value:
+        # iterating newest-first made every title advertise the group's OLDEST value
+        # as current, with the history printed backwards.
+        for summary in reversed(list(members)):        # newest -> oldest
+            for pair in (summary.fact_keys or sorted(extract_fact_keys(summary.text))):
+                if "=" not in pair:
+                    continue
+                attr, _, _value = pair.partition("=")
+                attr = attr.strip()
+                if not attr:
+                    continue
+                if attr not in values:
+                    values[attr] = []
+                    order.append(attr)
+        for summary in list(members):                  # oldest -> newest
             for pair in (summary.fact_keys or sorted(extract_fact_keys(summary.text))):
                 if "=" not in pair:
                     continue
@@ -1188,14 +1328,14 @@ class MemoryManager:
                 attr, value = attr.strip(), value.strip()
                 if not attr or not value:
                     continue
-                if attr not in values:
-                    values[attr] = []
-                    order.append(attr)
-                if value not in values[attr]:
-                    values[attr].append(value)
+                seq = values.setdefault(attr, [])
+                if value not in seq:
+                    seq.append(value)
         parts: List[str] = []
         for attr in order[:max_attrs]:
-            seq = values[attr]
+            seq = values.get(attr) or []
+            if not seq:
+                continue
             latest = seq[-1]
             history = "→".join(seq[:-1][-max_history:])
             parts.append(f"{attr}={latest}" + (f"[{history}→{latest}]" if history else ""))
@@ -1331,6 +1471,9 @@ class MemoryManager:
                 episode_id=self.episode_id,
             )
         self.store.add_active_summary(merged, episode_id=self.episode_id)
+        # The merged-away summaries may have been filed under a title; drop them
+        # there too, or the index keeps advertising facts that are no longer in it.
+        self._detach_from_indexes([s.summary_id for s in batch], stats)
         self.compressions += 1
         stats.capacity_merged_ids = [s.summary_id for s in batch]
         logger.info(
@@ -1435,6 +1578,7 @@ class MemoryManager:
         stats.lazy_summary_count = len(self.lazy_summaries())
         stats.active_chain_tokens = self.active_chain_tokens()
         stats.active_chain_text_tokens = self.active_chain_text_tokens()
+        stats.current_values_tokens = estimate_tokens(self.render_current_values())
         stats.window_size = len(self.get_window())
         stats.archived_total = self.store.count_archived_summaries(self.episode_id)
         stats.raw_total = self.store.count_raw_records(self.episode_id)
@@ -1456,12 +1600,15 @@ class MemoryManager:
             "all_rendered_tokens": self.all_rendered_tokens(),
             "active_chain_tokens": self.active_chain_tokens(),
             "active_chain_text_tokens": self.active_chain_text_tokens(),
+            "current_values_tokens": estimate_tokens(self.render_current_values()),
+            "current_values": self.render_current_values(),
             "archived_count": self.store.count_archived_summaries(self.episode_id),
             "raw_count": self.store.count_raw_records(self.episode_id),
             "overrides_events": sum(1 for s in self.stats if s.event_triggered),
             "overridden_summaries": self.overrides,
             "capacity_compressions": self.compressions,
             "indexes_built": self.indexes_built,
+            "index_updates": sum(s.index_updates for s in self.stats),
             "summary_truncations": self.summary_truncations,
             "super_indexes": self.super_indexes,
             "chain_strategy": self.chain_strategy,

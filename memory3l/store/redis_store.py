@@ -421,6 +421,7 @@ def loads_index(raw: Any) -> IndexEntry:
     return IndexEntry(
         index_id=d["index_id"],
         title=d.get("title", ""),
+        theme=d.get("theme", "") or "",
         members=list(d.get("members") or []),
         span_start=d.get("span_start") or 0.0,
         span_end=d.get("span_end") or 0.0,

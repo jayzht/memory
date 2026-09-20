@@ -495,31 +495,41 @@ def build_memory_block(
     window: Sequence[RawDialogRecord],
     chain: Sequence[ActiveSummary],
     indexes: Sequence["IndexEntry"] = (),
+    current_values: str = "",
 ) -> str:
     """
     The memory blocks, in the mandated order:
-    recent raw dialogue -> index layer (titles) -> active summary chain.
+    recent raw dialogue -> current values -> index layer (titles) -> active chain.
 
     The index layer is the "table of contents" level: each entry summarises a
     stretch and points at the summaries underneath it.  The model can read a title
     and, if it needs the detail, expand that group (``expand_index``) or jump
     straight to a member summary id.
+
+    ``<CURRENT_VALUES>`` is the derived ``属性=最新值`` registry.  It is the top-level
+    guarantee that the *current* value of an attribute is visible without a tool
+    call: index titles truncate, are recomputed per group, and used to go stale when
+    a member was overridden, which is exactly how a value ended up reachable only
+    from inside an index member.
     """
-    return "\n".join(
-        [
-            "<RECENT_RAW_DIALOGUE>",
-            render_recent_window(window),
-            "</RECENT_RAW_DIALOGUE>",
-            "",
-            "<INDEX_LAYER>",
-            render_index_layer(indexes),
-            "</INDEX_LAYER>",
-            "",
-            "<ACTIVE_SUMMARY_CHAIN>",
-            render_active_chain(chain),
-            "</ACTIVE_SUMMARY_CHAIN>",
-        ]
-    )
+    blocks = [
+        "<RECENT_RAW_DIALOGUE>",
+        render_recent_window(window),
+        "</RECENT_RAW_DIALOGUE>",
+        "",
+    ]
+    if current_values:
+        blocks += ["<CURRENT_VALUES>", current_values, "</CURRENT_VALUES>", ""]
+    blocks += [
+        "<INDEX_LAYER>",
+        render_index_layer(indexes),
+        "</INDEX_LAYER>",
+        "",
+        "<ACTIVE_SUMMARY_CHAIN>",
+        render_active_chain(chain),
+        "</ACTIVE_SUMMARY_CHAIN>",
+    ]
+    return "\n".join(blocks)
 
 
 def build_agent_messages(
@@ -531,6 +541,7 @@ def build_agent_messages(
     indexes: Sequence["IndexEntry"] = (),
     selfwrite: bool = False,
     tools_available: bool = True,
+    current_values: str = "",
 ) -> List[dict]:
     """
     Chat messages for one agent step.
@@ -551,7 +562,7 @@ def build_agent_messages(
     wrong even though the value was in its context, which deflates the baselines.
     """
     user_parts = [
-        build_memory_block(window, chain, indexes),
+        build_memory_block(window, chain, indexes, current_values=current_values),
         "",
         f"<QUESTION>\n{question.strip()}\n</QUESTION>",
     ]

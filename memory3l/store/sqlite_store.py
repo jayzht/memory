@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS index_entries (
     episode_id    TEXT NOT NULL DEFAULT '',
     seq           INTEGER NOT NULL DEFAULT -1,
     title         TEXT NOT NULL DEFAULT '',
+    theme         TEXT NOT NULL DEFAULT '',
     members       TEXT NOT NULL DEFAULT '',
     member_lines  TEXT NOT NULL DEFAULT '',
     span_start    REAL NOT NULL DEFAULT 0,
@@ -174,7 +175,8 @@ class SQLiteColdStore:
             # full member summaries instead of a ~10-token snippet; losing
             # ``child_index_ids`` broke super-index bookkeeping.
             "index_entries": {"previews": "TEXT NOT NULL DEFAULT ''",
-                              "child_index_ids": "TEXT NOT NULL DEFAULT ''"},
+                              "child_index_ids": "TEXT NOT NULL DEFAULT ''",
+                              "theme": "TEXT NOT NULL DEFAULT ''"},
         }
         for table, columns in additions.items():
             existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
@@ -434,12 +436,13 @@ class SQLiteColdStore:
 
         self.execute(
             """INSERT INTO index_entries
-                   (index_id, episode_id, seq, title, members, member_lines,
+                   (index_id, episode_id, seq, title, theme, members, member_lines,
                     span_start, span_end, turn_start, turn_end, fact_keys,
                     previews, child_index_ids, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(index_id) DO UPDATE SET
                    episode_id=excluded.episode_id, seq=excluded.seq, title=excluded.title,
+                   theme=excluded.theme,
                    members=excluded.members, member_lines=excluded.member_lines,
                    span_start=excluded.span_start, span_end=excluded.span_end,
                    turn_start=excluded.turn_start, turn_end=excluded.turn_end,
@@ -447,6 +450,7 @@ class SQLiteColdStore:
                    child_index_ids=excluded.child_index_ids, timestamp=excluded.timestamp""",
             (
                 entry.index_id, entry.episode_id, int(entry.seq), entry.title,
+                getattr(entry, "theme", "") or "",
                 pack_refs(entry.members), pack_refs(entry.member_summaries),
                 float(entry.span_start), float(entry.span_end),
                 int(entry.turn_start), int(entry.turn_end),
@@ -477,6 +481,7 @@ class SQLiteColdStore:
         return IndexEntry(
             index_id=row["index_id"],
             title=row["title"],
+            theme=row["theme"] if "theme" in keys else "",
             members=unpack_refs(row["members"]),
             span_start=row["span_start"],
             span_end=row["span_end"],
