@@ -156,15 +156,105 @@ CREATE TABLE IF NOT EXISTS experiment_runs (
 class SQLiteColdStore:
     """Thin, thread-safe SQLite wrapper. No ORM, no magic."""
 
-    def __init__(self, path: str = "./exp_memory.db"):
+    backend_name = "sqlite_cold"
+
+    def __init__(self, path: str = "./exp_memory.db", recent_window_turns: int = 4):
         self.path = path
         if path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
+        self.recent_window_turns = recent_window_turns
+        self._bound_episode: Optional[str] = None
+        self._current_turn_index: int = -1
+        self.reset_calls = 0
         self._configure()
         self._create_schema()
+
+    # ------------------------------------------------------------------ #
+    # Episode binding and lifecycle
+    #
+    # These exist so this store can drive ``MemoryManager`` on its own, with no
+    # Redis and no broker to install.  The audit surface never needed a hot
+    # layer, and neither does a single-process run: the cold store is the source
+    # of truth, so it can also be the only store.
+    #
+    # Note the deliberate asymmetry with ``BaseMemoryStore``: the query methods
+    # here keep their ``episode_id=None`` meaning of "every episode", which is
+    # what makes the store useful as a whole-file query surface.  The bound
+    # episode is only needed by the turn bookkeeping below.
+    # ------------------------------------------------------------------ #
+    def bind_episode(
+        self,
+        episode_id: str,
+        *,
+        recent_window_turns: Optional[int] = None,
+        reset: bool = False,
+        flush_hot_keys: bool = False,
+    ) -> None:
+        """Select the active episode namespace."""
+        if reset:
+            self.reset(episode_id=episode_id, flush_hot_keys=flush_hot_keys)
+        self._bound_episode = episode_id
+        self._current_turn_index = -1
+        if recent_window_turns:
+            self.recent_window_turns = recent_window_turns
+
+    @property
+    def bound_episode(self) -> Optional[str]:
+        return self._bound_episode
+
+    def _ep(self, episode_id: Optional[str]) -> str:
+        episode = episode_id or self._bound_episode
+        if not episode:
+            raise ValueError("no episode bound: call bind_episode() first")
+        return episode
+
+    def set_turn_index(self, turn_index: int) -> None:
+        self._current_turn_index = turn_index
+
+    def next_turn_index(self) -> int:
+        """Monotonic turn ordinal inside the bound episode."""
+        self._current_turn_index += 1
+        return self._current_turn_index
+
+    @property
+    def current_turn_index(self) -> int:
+        return self._current_turn_index
+
+    def reset(self, episode_id: Optional[str] = None, flush_hot_keys: bool = False) -> None:
+        """
+        Start a clean episode: drop the working state, keep the permanent data.
+
+        ``archived_summaries`` and ``raw_records`` are untouched, exactly as in the
+        hybrid store -- an evaluation sample must not be able to inherit the
+        previous one, but permanence is the whole point of the other two layers.
+        ``flush_hot_keys`` is accepted and ignored: there is no hot layer here to
+        flush, and inventing one would be worse than saying so.
+        """
+        episode = episode_id or self._bound_episode
+        if episode is None:
+            raise ValueError("reset() needs an episode_id (or bind one first)")
+        self.reset_calls += 1
+        self.clear_active_summaries(episode)
+        self.clear_indexes(episode)
+        self.clear_window(episode)
+        logger.debug("reset(%s): working state cleared, archive/raw kept", episode)
+
+    def purge_episode(self, episode_id: str) -> None:
+        """Wipe one episode completely, archive and raw records included."""
+        self.reset(episode_id=episode_id)
+        self.drop_episode(episode_id, keep_archive=False)
+
+    def checksum(self) -> Dict[str, int]:
+        """Cheap integrity summary, handy in logs and checkpoints."""
+        return {
+            "active": len(self.list_active_summaries(self._bound_episode)),
+            "window": len(self.get_window(self._bound_episode)),
+            "raw": self.count_raw_records(self._bound_episode),
+            "archived": self.count_archived_summaries(self._bound_episode),
+        }
 
     # ------------------------------------------------------------------ #
     # connection plumbing
@@ -240,7 +330,10 @@ class SQLiteColdStore:
     # ------------------------------------------------------------------ #
     # raw records
     # ------------------------------------------------------------------ #
-    def add_raw_record(self, record: RawDialogRecord) -> None:
+    def add_raw_record(
+        self, record: RawDialogRecord, episode_id: Optional[str] = None
+    ) -> None:
+        record.episode_id = record.episode_id or self._ep(episode_id)
         self.execute(
             """INSERT INTO raw_records
                    (reference_id, episode_id, turn_index, user_msg, agent_msg, timestamp, meta)
@@ -327,7 +420,10 @@ class SQLiteColdStore:
     # ------------------------------------------------------------------ #
     # archived summaries
     # ------------------------------------------------------------------ #
-    def add_archived_summary(self, archived: ArchivedSummary) -> None:
+    def add_archived_summary(
+        self, archived: ArchivedSummary, episode_id: Optional[str] = None
+    ) -> None:
+        archived.episode_id = archived.episode_id or self._ep(episode_id)
         self.execute(
             """INSERT INTO archived_summaries
                    (summary_id, episode_id, seq, text, override_ids, timestamp, raw_ref_id,
@@ -415,7 +511,10 @@ class SQLiteColdStore:
     # ------------------------------------------------------------------ #
     # active chain mirror (crash recovery only)
     # ------------------------------------------------------------------ #
-    def add_active_summary(self, summary: ActiveSummary) -> None:
+    def add_active_summary(
+        self, summary: ActiveSummary, episode_id: Optional[str] = None
+    ) -> None:
+        summary.episode_id = summary.episode_id or self._ep(episode_id)
         self.execute(
             """INSERT INTO active_summaries
                    (summary_id, episode_id, seq, text, override_ids, timestamp,
@@ -443,8 +542,46 @@ class SQLiteColdStore:
             ),
         )
 
-    def remove_active_summary(self, summary_id: str) -> None:
-        self.execute("DELETE FROM active_summaries WHERE summary_id=?", (summary_id,))
+    def remove_active_summary(
+        self, summary_id: str, episode_id: Optional[str] = None
+    ) -> Optional[ActiveSummary]:
+        """
+        Delete an active summary and return what was deleted.
+
+        Returning the object is not a convenience -- it is the contract, and the
+        override path depends on it.  ``MemoryManager`` archives the summary it
+        just removed, and it reads that summary from this return value:
+
+            old = store.remove_active_summary(overridden_id, ...)
+            if old is None: continue          # nothing to archive
+            store.add_archived_summary(ArchivedSummary.from_active(old, ...))
+
+        A DELETE that returned nothing therefore did not merely lose an object: it
+        made every override skip its archive step, so the overridden text vanished
+        with no forward pointer.  That is silent loss, and it is precisely what I1
+        reports -- which is how this was found.  The hybrid store masked it by
+        reading the summary itself before delegating here.
+
+        Read and delete share one lock so no concurrent writer can archive a
+        summary that has already been replaced.
+        """
+        params: tuple = (summary_id,)
+        where = "summary_id=?"
+        if episode_id is not None:
+            # Summary ids are unique per episode, so scoping the delete prevents
+            # removing another episode's summary that happens to share an id.
+            where += " AND episode_id=?"
+            params = (summary_id, episode_id)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT * FROM active_summaries WHERE {where}", params
+            ).fetchone()
+            if row is None:
+                return None
+            summary = self._row_to_active(row)
+            self._conn.execute(f"DELETE FROM active_summaries WHERE {where}", params)
+            self._conn.commit()
+        return summary
 
     # ------------------------------------------------------------------ #
     # read-side conveniences from the BaseMemoryStore contract
@@ -482,6 +619,23 @@ class SQLiteColdStore:
             if summary.summary_id not in title_members
         ]
 
+    @staticmethod
+    def _row_to_active(row: sqlite3.Row) -> ActiveSummary:
+        return ActiveSummary(
+            summary_id=row["summary_id"],
+            text=row["text"],
+            override_ids=unpack_refs(row["override_ids"]),
+            timestamp=row["timestamp"],
+            raw_ref_id=row["raw_ref_id"],
+            episode_id=row["episode_id"],
+            seq=row["seq"],
+            origin=row["origin"],
+            raw_ref_ids=unpack_refs(row["raw_ref_ids"]) or unpack_refs(row["raw_ref_id"]),
+            merged_from=unpack_refs(row["merged_from"]),
+            fact_keys=unpack_refs(row["fact_keys"]) if "fact_keys" in row.keys() else [],
+            index_id=(row["index_id"] if "index_id" in row.keys() else "") or "",
+        )
+
     def list_active_summaries(self, episode_id: Optional[str] = None) -> List[ActiveSummary]:
         if episode_id is None:
             rows = self.query("SELECT * FROM active_summaries ORDER BY timestamp, seq")
@@ -490,30 +644,13 @@ class SQLiteColdStore:
                 "SELECT * FROM active_summaries WHERE episode_id=? ORDER BY timestamp, seq",
                 (episode_id,),
             )
-        out: List[ActiveSummary] = []
-        for row in rows:
-            out.append(
-                ActiveSummary(
-                    summary_id=row["summary_id"],
-                    text=row["text"],
-                    override_ids=unpack_refs(row["override_ids"]),
-                    timestamp=row["timestamp"],
-                    raw_ref_id=row["raw_ref_id"],
-                    episode_id=row["episode_id"],
-                    seq=row["seq"],
-                    origin=row["origin"],
-                    raw_ref_ids=unpack_refs(row["raw_ref_ids"]) or unpack_refs(row["raw_ref_id"]),
-                    merged_from=unpack_refs(row["merged_from"]),
-                    fact_keys=unpack_refs(row["fact_keys"]) if "fact_keys" in row.keys() else [],
-                    index_id=(row["index_id"] if "index_id" in row.keys() else "") or "",
-                )
-            )
-        return out
+        return [self._row_to_active(row) for row in rows]
 
     # ------------------------------------------------------------------ #
     # index entries (level 2 of layer 1)
     # ------------------------------------------------------------------ #
-    def add_index_entry(self, entry) -> None:
+    def add_index_entry(self, entry, episode_id: Optional[str] = None) -> None:
+        entry.episode_id = entry.episode_id or self._ep(episode_id)
         import json
 
         self.execute(
@@ -597,9 +734,25 @@ class SQLiteColdStore:
             return None
         return entry
 
+    def summaries_under_index(
+        self, index_id: str, episode_id: Optional[str] = None
+    ) -> List[ActiveSummary]:
+        """
+        Resolve an index to its member summaries (the catalogue behind a title).
+
+        Implemented here rather than inherited because this store does not extend
+        ``BaseMemoryStore``.  Members are filtered against the *live* active
+        summaries on purpose: an index that still lists an overridden member is
+        exactly the stale-pointer failure this lookup must not paper over.
+        """
+        entry = self.get_index_entry(index_id, episode_id)
+        if entry is None:
+            return []
+        members = {s.summary_id: s for s in self.list_active_summaries(entry.episode_id)}
+        return [members[sid] for sid in entry.members if sid in members]
+
     def remove_index_entry(self, index_id: str, episode_id: Optional[str] = None) -> None:
         self.execute("DELETE FROM index_entries WHERE index_id=?", (index_id,))
-
     def clear_indexes(self, episode_id: str) -> None:
         self.execute("DELETE FROM index_entries WHERE episode_id=?", (episode_id,))
 
@@ -708,6 +861,27 @@ class SQLiteColdStore:
     # ------------------------------------------------------------------ #
     # sliding window mirror (crash recovery only)
     # ------------------------------------------------------------------ #
+    def append_window_record(
+        self, record: RawDialogRecord, episode_id: Optional[str] = None
+    ) -> List[RawDialogRecord]:
+        """
+        Append one turn to the window and trim it to ``recent_window_turns``.
+
+        Reading and rewriting the whole window is not the cheapest possible
+        implementation, but the window is a handful of rows and going through
+        ``set_window`` keeps the trim rule in exactly one place -- a second,
+        subtly different trim (``window[-0:]`` returns the *whole* list) is how
+        sliding windows quietly stop sliding.
+        """
+        episode = record.episode_id or self._ep(episode_id)
+        window = self.get_window(episode)
+        window.append(record)
+        limit = self.recent_window_turns
+        if limit and len(window) > limit:
+            window = window[-limit:]
+        self.set_window(episode, window)
+        return list(window)
+
     def set_window(self, episode_id: str, records: Sequence[RawDialogRecord]) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM sliding_window WHERE episode_id=?", (episode_id,))

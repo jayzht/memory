@@ -431,6 +431,114 @@ class TestSQLitePersistence(unittest.TestCase):
         self.assertEqual(loaded.seq, 3)
 
 
+class TestColdStoreStandalone(unittest.TestCase):
+    """
+    The SQLite cold store has to be usable *as the only store*.
+
+    It was not: it had no episode binding and no turn bookkeeping, so it could not
+    drive ``MemoryManager`` at all, and the missing methods were papered over at
+    every call site instead.  These tests pin the contract that made it usable --
+    including the return value of ``remove_active_summary``, which is not a
+    convenience but the thing the override path archives from.
+    """
+
+    def setUp(self):
+        self.store = SQLiteColdStore(":memory:")
+
+    def tearDown(self):
+        self.store.close()
+
+    @staticmethod
+    def _summary(summary_id="ep/s001", episode_id="ep", text="x", seq=1):
+        return ActiveSummary(
+            summary_id=summary_id, text=text, episode_id=episode_id, seq=seq,
+            timestamp=float(seq), raw_ref_id=f"{episode_id}/r{seq}",
+            raw_ref_ids=[f"{episode_id}/r{seq}"], origin="event",
+            fact_keys=["k=v"],
+        )
+
+    def test_remove_active_summary_returns_what_it_deleted(self):
+        """
+        Regression: a bare DELETE returned None, so MemoryManager's
+        ``if old is None: continue`` skipped archiving on every override and the
+        overridden text vanished with no forward pointer.  I1 reports exactly that.
+        """
+        self.store.add_active_summary(self._summary(), episode_id="ep")
+        removed = self.store.remove_active_summary("ep/s001", episode_id="ep")
+        self.assertIsNotNone(removed, "the removed summary must be returned, or overrides lose their archive step")
+        self.assertEqual(removed.summary_id, "ep/s001")
+        self.assertEqual(removed.fact_keys, ["k=v"])
+        self.assertIsNone(self.store.get_active_summary("ep/s001", episode_id="ep"))
+
+    def test_remove_of_an_unknown_id_is_none(self):
+        self.assertIsNone(self.store.remove_active_summary("ep/nope", episode_id="ep"))
+
+    def test_remove_with_a_mismatched_episode_is_a_no_op(self):
+        """
+        ``summary_id`` is the table's primary key, so two episodes cannot actually
+        hold the same id through this API -- a second insert overwrites the first.
+        The episode scoping is therefore defence in depth for raw SQL and future
+        callers, and "nothing was deleted" is the property worth pinning.
+        """
+        self.store.add_active_summary(self._summary(summary_id="ep/s001", episode_id="A"), episode_id="A")
+        self.assertIsNone(self.store.remove_active_summary("ep/s001", episode_id="B"))
+        self.assertIsNotNone(self.store.get_active_summary("ep/s001", episode_id="A"))
+
+    def test_override_round_trip_keeps_the_fact_reachable(self):
+        """The consequence that matters: remove-then-archive must not lose the value."""
+        self.store.add_active_summary(self._summary(), episode_id="ep")
+        old = self.store.remove_active_summary("ep/s001", episode_id="ep")
+        self.store.add_archived_summary(
+            ArchivedSummary.from_active(old, is_overridden=True, superseded_by="ep/s002"),
+            episode_id="ep",
+        )
+        self.assertEqual(self.store.count_archived_summaries("ep"), 1)
+        self.assertEqual(self.store.get_archived_summary("ep/s001", episode_id="ep").superseded_by, "ep/s002")
+
+    def test_bind_and_turn_bookkeeping(self):
+        self.store.bind_episode("ep", reset=True)
+        self.assertEqual(self.store.bound_episode, "ep")
+        self.assertEqual(self.store.next_turn_index(), 0)
+        self.assertEqual(self.store.next_turn_index(), 1)
+        self.store.set_turn_index(7)
+        self.assertEqual(self.store.current_turn_index, 7)
+
+    def test_reset_clears_working_state_and_keeps_permanent_data(self):
+        self.store.bind_episode("ep", reset=True)
+        self.store.add_active_summary(self._summary(), episode_id="ep")
+        self.store.add_archived_summary(
+            ArchivedSummary.from_active(self._summary(), is_overridden=True), episode_id="ep")
+        self.store.add_raw_record(
+            RawDialogRecord(reference_id="ep/r1", episode_id="ep", turn_index=0,
+                            user_msg="u", agent_msg="a", timestamp=1.0),
+            episode_id="ep")
+        self.store.reset(episode_id="ep")
+        self.assertEqual(self.store.list_active_summaries("ep"), [])
+        self.assertEqual(self.store.count_archived_summaries("ep"), 1, "archive is permanent")
+        self.assertEqual(self.store.count_raw_records("ep"), 1, "raw dialogue is permanent")
+
+    def test_append_window_record_trims_to_the_window(self):
+        self.store.recent_window_turns = 2
+        self.store.bind_episode("ep", reset=True)
+        for turn in range(4):
+            window = self.store.append_window_record(
+                RawDialogRecord(reference_id=f"ep/r{turn}", episode_id="ep", turn_index=turn,
+                                user_msg=f"u{turn}", agent_msg="a", timestamp=float(turn)),
+                episode_id="ep")
+        self.assertEqual([r.turn_index for r in window], [2, 3])
+        self.assertEqual([r.turn_index for r in self.store.get_window("ep")], [2, 3])
+
+    def test_summaries_under_index_resolves_live_members_only(self):
+        self.store.add_active_summary(self._summary(summary_id="ep/s001"), episode_id="ep")
+        self.store.add_active_summary(self._summary(summary_id="ep/s002", seq=2), episode_id="ep")
+        self.store.add_index_entry(
+            IndexEntry(index_id="ep/idx", episode_id="ep", seq=1, title="t",
+                       members=["ep/s001", "ep/gone"]),
+            episode_id="ep")
+        members = [s.summary_id for s in self.store.summaries_under_index("ep/idx", episode_id="ep")]
+        self.assertEqual(members, ["ep/s001"], "a stale pointer must not resolve")
+
+
 class TestInMemoryStore(unittest.TestCase):
     def test_reset_isolates_episodes(self):
         store = InMemoryStore(recent_window_turns=1)
