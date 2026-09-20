@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Sequence
 
 from ..llm import LLMError
 from ..models import RawDialogRecord, make_id, now_ts
-from ..prompts import build_agent_messages, build_full_context_messages
+from ..prompts import build_agent_messages, build_full_context_messages, insert_after_recent_window
 from ..token_utils import estimate_tokens
 from .base_agent import BaseAgent
 
@@ -203,10 +203,16 @@ class MemGPTStyleAgent(BaseAgent):
             if self._rolling_summary
             else ["<ROLLING_SUMMARY>\n(empty)\n</ROLLING_SUMMARY>"]
         )
-        messages = build_agent_messages(window, [], question, recent_window_turns=self.recent_window_turns)
+        messages = build_agent_messages(
+            window, [], question,
+            recent_window_turns=self.recent_window_turns,
+            tools_available=self.supports_tools(),
+        )
         # Inject the rolling summary right after the recent window (it replaces
         # the older raw turns that were destroyed).
-        messages[1]["content"] = "\n".join(chain_block + [messages[1]["content"]])
+        messages[1]["content"] = insert_after_recent_window(
+            messages[1]["content"], "\n".join(chain_block)
+        )
         return messages
 
     def _remaining_records(self) -> List[RawDialogRecord]:
@@ -327,9 +333,13 @@ class NaiveChainAgent(BaseAgent):
             block_lines.append("(empty)")
         block_lines.append("</SUMMARY_CHAIN>")
         messages = build_agent_messages(
-            self.store.get_window(self.episode_id), [], question, recent_window_turns=self.recent_window_turns
+            self.store.get_window(self.episode_id), [], question,
+            recent_window_turns=self.recent_window_turns,
+            tools_available=self.supports_tools(),
         )
-        messages[1]["content"] = "\n".join(block_lines) + "\n\n" + messages[1]["content"]
+        messages[1]["content"] = insert_after_recent_window(
+            messages[1]["content"], "\n".join(block_lines)
+        )
         return messages
 
     def finalize_episode(self) -> Dict[str, Any]:

@@ -30,7 +30,13 @@ from ..models import ToolResult
 from ..prompts import build_tool_followup_messages
 from ..store.base import BaseMemoryStore
 from ..token_utils import count_message_tokens
-from ..tools import ToolExecutor, is_tool_call, parse_tool_calls, split_selfwrite_reply
+from ..tools import (
+    KNOWN_TOOLS,
+    ToolExecutor,
+    is_tool_call,
+    parse_tool_calls,
+    split_selfwrite_reply,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,9 @@ class AgentRunResult:
     memory_block: str = ""
     selfwrite_requested: bool = False
     selfwrite_used: bool = False
+    #: True when a tool call had to be discarded instead of being accepted as the
+    #: answer (iteration cap reached, or a system with no executor emitted one).
+    tool_call_as_answer: bool = False
     #: Full per-step trace (model reply + every tool's retrieval path and
     #: candidates).  Collected only when ``agent.debug`` is on.
     steps: List[Dict[str, Any]] = field(default_factory=list)
@@ -217,9 +226,26 @@ class BaseAgent(abc.ABC):
         else:  # pragma: no cover - loop exhausted
             final_text = ""
 
+        # A tool call is never an answer.  Two ways one can end up here: the loop
+        # hit its iteration cap while the model kept calling tools, or a system
+        # without an executor emitted one anyway.  Left alone it becomes the
+        # prediction, and the judge scores a call string as a wrong answer.
+        if final_text and (is_tool_call(final_text) or _looks_like_tool_intent(final_text)):
+            logger.debug(
+                "discarding a tool call offered as the final answer: %s", final_text[:160]
+            )
+            result.tool_call_as_answer = True
+            final_text = ""
         if not final_text:
             final_text = self._force_answer(question, messages, result)
             self._record_step(result, -1, "forced_answer", final_text, [])
+            # Even the tool-free re-ask can return a call string (a model that is
+            # stuck in the tool grammar).  Never hand that to the judge as the
+            # prediction; an empty answer is scored as wrong, which is honest.
+            if final_text and (is_tool_call(final_text) or _looks_like_tool_intent(final_text)):
+                logger.debug("forced answer was still a tool call; discarding it")
+                result.tool_call_as_answer = True
+                final_text = ""
         if selfwrite and final_text:
             # The memory block is machine-readable payload, not part of the answer:
             # strip it before the answer reaches the user, the judge or the CSV.
@@ -331,12 +357,18 @@ class BaseAgent(abc.ABC):
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-_TOOL_INTENT_HINTS = ("get_archived_summary", "get_raw_record")
+#: Every dispatchable tool, so a malformed call to *any* of them is at least
+#: recognised as an attempt instead of silently becoming the final answer.
+_TOOL_INTENT_HINTS = tuple(KNOWN_TOOLS)
 
 
 def _looks_like_tool_intent(text: str) -> bool:
     lowered = text.lower()
-    return any(hint in lowered for hint in _TOOL_INTENT_HINTS) and "(" in text
+    # Full-width parentheses are a realistic output for a Chinese-oriented prompt
+    # and must not make an attempted call invisible.
+    if "(" not in text and "（" not in text:
+        return False
+    return any(hint in lowered for hint in _TOOL_INTENT_HINTS)
 
 
 def build_agent(

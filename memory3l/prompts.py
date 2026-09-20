@@ -389,6 +389,34 @@ TOOL_DESCRIPTIONS = """可用工具 / available tools:
    按属性名 + 锚点值精确回溯：先定位记录 reference_value 的那条摘要，再返回被它直接取代的旧值。
    用于回答"某属性的旧值/之前是什么"。返回里会给出被考虑过的候选与选中理由。"""
 
+#: Used instead of ``agent_system_prompt`` + ``TOOL_DESCRIPTIONS`` for systems
+#: whose ``executor`` is None.  Those systems must not be told to call tools (the
+#: call string becomes their answer and the probe is scored wrong) nor be told
+#: about INDEX_LAYER / ARCHIVE layers their memory does not have.  The *answer
+#: contract* is intentionally identical to the shared one, so the comparison is
+#: about the memory mechanism rather than about the prompt.
+NEUTRAL_SYSTEM_ZH = """你是一个对话助手。上面【记忆】部分给出的内容就是你掌握的全部信息
+（不同系统的记忆形式不同：可能是原始对话、滚动摘要或摘要链）。请仅依据它回答问题。
+要求：
+1. 严格区分"当前有效事实"与"已被后续对话更新/否定的历史事实"。
+2. 先给结论，再给依据（引用是哪一轮说的）。
+3. 记忆里没有的信息，回答"记忆中没有该信息"，不要编造。
+4. 若问题包含选项 (a)(b)(c)(d)，答案中必须带上选项字母。
+5. 你没有可调用的工具，不要输出函数调用或工具语法，直接给出答案。"""
+
+NEUTRAL_SYSTEM_EN = """You are a dialogue assistant. The MEMORY section above is everything you
+know (different systems store it differently: raw dialogue, a rolling summary or a summary
+chain). Answer only from it.
+Rules: separate facts that are still valid from facts that later dialogue updated or negated;
+lead with the conclusion then the evidence (which turn); say "not in memory" when unknown;
+include the option letter when options (a)-(d) are given; you have no tools, so never output a
+function call or tool syntax."""
+
+
+def neutral_system_prompt() -> str:
+    return NEUTRAL_SYSTEM_ZH if PROMPT_LANG == "zh" else NEUTRAL_SYSTEM_EN
+
+
 
 # --------------------------------------------------------------------------- #
 # 4. Context assembly
@@ -412,6 +440,24 @@ def render_active_chain(summaries: Sequence[ActiveSummary]) -> str:
     if not summaries:
         return "(empty)"
     return "\n".join(summary.render() for summary in summaries)
+
+
+RECENT_WINDOW_CLOSE = "</RECENT_RAW_DIALOGUE>"
+
+
+def insert_after_recent_window(user_content: str, block: str) -> str:
+    """
+    Place an extra memory block *right after* the recent window.
+
+    The two summary baselines prepended their block to the whole user message,
+    which put it *before* ``<RECENT_RAW_DIALOGUE>`` -- contradicting the fixed
+    order (window -> memory -> question) that their own comments claimed.
+    """
+    position = user_content.find(RECENT_WINDOW_CLOSE)
+    if position < 0:
+        return block + "\n\n" + user_content
+    cut = position + len(RECENT_WINDOW_CLOSE)
+    return user_content[:cut] + "\n" + block + user_content[cut:]
 
 
 def render_index_layer(entries) -> str:
@@ -484,6 +530,7 @@ def build_agent_messages(
     extra_instruction: str = "",
     indexes: Sequence["IndexEntry"] = (),
     selfwrite: bool = False,
+    tools_available: bool = True,
 ) -> List[dict]:
     """
     Chat messages for one agent step.
@@ -496,6 +543,12 @@ def build_agent_messages(
     Putting the system prompt in a ``system`` role is what every chat template
     does; the *memory* ordering -- the part the experiment varies -- is exactly
     as specified.
+
+    ``tools_available=False`` must be passed by systems whose ``executor`` is
+    ``None``.  Advertising a tool manual to a system that cannot execute tools is
+    not a neutral difference: the model follows the instruction, emits a tool
+    call, and that call string becomes its final answer -- so the probe is scored
+    wrong even though the value was in its context, which deflates the baselines.
     """
     user_parts = [
         build_memory_block(window, chain, indexes),
@@ -504,7 +557,11 @@ def build_agent_messages(
     ]
     if extra_instruction:
         user_parts.append(extra_instruction)
-    system_content = agent_system_prompt(recent_window_turns) + "\n\n" + TOOL_DESCRIPTIONS
+    system_content = (
+        agent_system_prompt(recent_window_turns) + "\n\n" + TOOL_DESCRIPTIONS
+        if tools_available
+        else neutral_system_prompt()
+    )
     if selfwrite:
         # Appended to the *system* role so it survives every tool-call iteration:
         # the model must attach the block to its last reply, whenever that is.

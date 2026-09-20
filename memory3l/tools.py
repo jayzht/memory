@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import unicodedata
 from typing import Any, Dict, List, Optional, Sequence
 
 from .models import LAZY_INDEX_ID, ToolCall, ToolResult
@@ -67,14 +68,6 @@ class SummaryParseError(ValueError):
     """Raised when a summariser response cannot be parsed at all."""
 
 
-def _strip_tag(body: str, pattern: "re.Pattern") -> "tuple":
-    """Remove the first match of ``pattern`` from ``body``; return (body, payload)."""
-    match = pattern.search(body)
-    if not match:
-        return body, None
-    return (body[: match.start()] + body[match.end() :]).strip(), match.group(1)
-
-
 def parse_summary_response(
     text: str,
     valid_ids: Optional[Sequence[str]] = None,
@@ -102,23 +95,32 @@ def parse_summary_response(
     raw_ids: List[str] = []
 
     # Both tag lines are stripped from the body before anything else, so the
-    # stored summary text contains only the summary itself.
-    body, facts_payload = _strip_tag(cleaned, _FACTS_RE)
-    body, overrides_payload = _strip_tag(body, _OVERRIDES_RE)
+    # stored summary text contains only the summary itself.  *Every* occurrence is
+    # removed: a model that emitted two ``[OVERRIDES]`` lines used to leave the
+    # second one behind, and it was then stored and rendered into the active chain
+    # as if it were summary prose.
+    facts_payloads = [m.group(1) for m in _FACTS_RE.finditer(cleaned)]
+    overrides_payloads = [m.group(1) for m in _OVERRIDES_RE.finditer(cleaned)]
+    body = _FACTS_RE.sub("", cleaned)
+    body = _OVERRIDES_RE.sub("", body)
+
     fact_keys: List[str] = []
-    if facts_payload:
+    for facts_payload in facts_payloads:
         for chunk in re.split(r"[;；|]", facts_payload):
-            if "=" in chunk:
-                key, _, value = chunk.partition("=")
-                key = key.strip().strip("，,。.；;:： ")
-                value = value.strip().strip("，,。.；;:： ")
-                if key and key.lower() not in NONE_TOKENS:
-                    # Keep the value: the chain renderer shows this line to the
-                    # summariser, which needs the current value to detect conflicts.
-                    fact_keys.append(f"{key}={value}" if value else key)
-    if overrides_payload is not None:
-        raw_ids = [p.strip() for p in re.split(r"[,，;；\s]+", overrides_payload) if p.strip()]
-        raw_ids = [i for i in raw_ids if i.lower() not in NONE_TOKENS]
+            if "=" not in chunk:
+                continue
+            key, _, value = chunk.partition("=")
+            key = key.strip().strip("，,。.；;:： ")
+            value = value.strip().strip("，,。.；;:： ")
+            if key and key.lower() not in NONE_TOKENS:
+                # Keep the value: the chain renderer shows this line to the
+                # summariser, which needs the current value to detect conflicts.
+                entry = f"{key}={value}" if value else key
+                if entry not in fact_keys:
+                    fact_keys.append(entry)
+    for overrides_payload in overrides_payloads:
+        emitted = [p.strip() for p in re.split(r"[,，;；\s]+", overrides_payload) if p.strip()]
+        raw_ids.extend(i for i in emitted if i.lower() not in NONE_TOKENS)
     # Trailing labels the model sometimes echoes.
     body = re.sub(r"^\s*(?:摘要|summary)\s*[:：]\s*", "", body, flags=re.IGNORECASE).strip()
     body = body.strip("` \n\t")
@@ -156,16 +158,34 @@ def parse_summary_response(
 # records the turn.  Harvesting is opportunistic -- when the block is missing or
 # malformed the caller falls back to the dedicated summariser, so a model that
 # ignores the instruction costs one extra call but never loses an update.
-_MEMORY_UPDATE_RE = re.compile(
-    r"<\s*MEMORY_UPDATE\s*>(.*?)(?:<\s*/\s*MEMORY_UPDATE\s*>|\Z)",
+_MEMORY_UPDATE_TAG = r"<\s*MEMORY_UPDATE\s*>"
+_MEMORY_UPDATE_CLOSE = r"<\s*/\s*MEMORY_UPDATE\s*>"
+#: Explicitly delimited block: opening and closing tag both present.
+_MEMORY_UPDATE_CLOSED_RE = re.compile(
+    _MEMORY_UPDATE_TAG + r"(?P<body>.*?)" + _MEMORY_UPDATE_CLOSE,
     re.IGNORECASE | re.DOTALL,
 )
+_MEMORY_UPDATE_OPEN_RE = re.compile(_MEMORY_UPDATE_TAG, re.IGNORECASE)
 # Tolerated variant: a fenced block labelled memory_update (some models cannot
 # resist wrapping machine-readable output in a fence).
+_FENCE_LABEL = r"```[ \t]*(?:memory[_-]?update|memory)[ \t]*\r?\n?"
 _MEMORY_UPDATE_FENCE_RE = re.compile(
-    r"```[ \t]*(?:memory[_-]?update|memory)[ \t]*\r?\n?(.*?)```",
-    re.IGNORECASE | re.DOTALL,
+    _FENCE_LABEL + r"(?P<body>.*?)```", re.IGNORECASE | re.DOTALL
 )
+_MEMORY_UPDATE_FENCE_OPEN_RE = re.compile(_FENCE_LABEL, re.IGNORECASE)
+
+
+def _looks_like_summary_payload(body: str) -> bool:
+    """
+    Is an *unterminated* block actually the summariser grammar?
+
+    The instruction always asks for a final ``[OVERRIDES: ...]`` line, so a real
+    block carries one of the two machine-readable tags.  Requiring that keeps a
+    prose mention ("the tag <MEMORY_UPDATE> records memory; the answer is 3F")
+    from being mistaken for a block and silently deleting the answer.
+    """
+    upper = (body or "").upper()
+    return "[OVERRIDES" in upper or "[FACTS" in upper
 
 
 def split_selfwrite_reply(text: str) -> "tuple":
@@ -173,19 +193,59 @@ def split_selfwrite_reply(text: str) -> "tuple":
     Split one agent reply into ``(visible_answer, memory_block_or_None)``.
 
     The visible answer is what the user (and the judge) sees; the block is the
-    summariser grammar, parsed by :func:`parse_summary_response`.
+    summariser grammar, parsed by :func:`parse_summary_response`.  The block must
+    never survive into the answer, so:
+    * **every** delimiter form is removed (a reply with two blocks used to leak
+      the second one, and an unterminated fenced block used to leak everything);
+    * once a block was found the raw text is never returned -- if nothing is left,
+      the block's own summary body stands in for the answer.
     """
     if not text:
         return "", None
-    match = _MEMORY_UPDATE_RE.search(text)
-    if match is None:
-        match = _MEMORY_UPDATE_FENCE_RE.search(text)
-    if match is None:
+
+    blocks: List[str] = []
+    visible = text
+    for pattern in (_MEMORY_UPDATE_CLOSED_RE, _MEMORY_UPDATE_FENCE_RE):
+        while True:
+            match = pattern.search(visible)
+            if match is None:
+                break
+            blocks.append((match.group("body") or "").strip())
+            visible = visible[: match.start()] + visible[match.end() :]
+
+    # An unterminated fence swallows the rest of the reply, but only when what
+    # follows really is the summary grammar.
+    unterminated_fence = _MEMORY_UPDATE_FENCE_OPEN_RE.search(visible)
+    if unterminated_fence is not None and _looks_like_summary_payload(
+        visible[unterminated_fence.end() :]
+    ):
+        blocks.append(visible[unterminated_fence.end() :].strip())
+        visible = visible[: unterminated_fence.start()]
+
+    # Same rule for a missing closing tag: trust the last opening tag only when
+    # the remainder carries the grammar.
+    last_open = None
+    for match in _MEMORY_UPDATE_OPEN_RE.finditer(visible):
+        last_open = match
+    if last_open is not None and _looks_like_summary_payload(visible[last_open.end() :]):
+        blocks.append(visible[last_open.end() :].strip())
+        visible = visible[: last_open.start()]
+
+    visible = visible.strip()
+    if not blocks:
         return text.strip(), None
-    block = (match.group(1) or "").strip()
-    visible = (text[: match.start()] + text[match.end() :]).strip()
-    # A reply that is *only* the block still has to answer something.
-    return (visible or text.strip()), (block or None)
+
+    block = next((b for b in blocks if b), "")
+    if not visible:
+        # The reply was *only* the block: answer with its summary body rather than
+        # handing the machine grammar back as if it were prose.
+        try:
+            parsed = parse_summary_response(block, valid_ids=None)
+            visible = (parsed.get("summary_text") or "").strip()
+        except SummaryParseError:
+            visible = ""
+        visible = visible or block
+    return visible.strip(), (block or None)
 
 
 # --------------------------------------------------------------------------- #
@@ -284,14 +344,22 @@ def parse_tool_calls(text: str) -> List[ToolCall]:
     * DeepSeek DSML markup (``<|DSML|invoke name="...">...``);
     * the same call wrapped in a markdown code fence.
 
-    Harness-written tool results (``[TOOL RESULT ...]``) are never treated as calls.
+    Text is NFKC-normalised first, so a model that writes full-width punctuation
+    (``（）：＝``, likely for a Chinese-oriented prompt) still produces a call
+    instead of an invisible one.  Harness-written ``[TOOL RESULT ...]`` lines are
+    stripped: a model that quotes a tool result must not re-execute it.
     """
     if not text:
         return []
+    # NFKC maps full-width forms onto their ASCII equivalents.  It is applied to
+    # the *call syntax*, not to stored content, and Chinese text is unaffected.
+    cleaned = unicodedata.normalize("NFKC", text)
+    cleaned = strip_tool_echoes(cleaned)
     # Strip code fences and DSML chatter *tokens* only, never whole lines: a DSML
-    # tool call is emitted on its own line, and a line-based echo filter would
-    # delete it before the DSML pattern ever sees it.
-    cleaned = _FENCE_RE.sub("", text.strip()).strip()
+    # tool call is emitted on its own line, and a broad line-based filter would
+    # delete it before the DSML pattern ever sees it.  ``_TOOL_ECHO_RE`` is
+    # anchored to the harness' own prefixes, so DSML (``<|...``) is untouched.
+    cleaned = _FENCE_RE.sub("", cleaned.strip()).strip()
     cleaned = _DSML_NOISE_RE.sub(" ", cleaned)
     if not cleaned.strip():
         return []
@@ -341,35 +409,68 @@ def parse_tool_calls(text: str) -> List[ToolCall]:
     return calls
 
 
+#: Aliases that mean the same thing whichever tool uses them.
+_ARG_ALIASES = {
+    "summaryid": "summary_id", "sid": "summary_id", "summary": "summary_id",
+    "referenceid": "reference_id", "refid": "reference_id",
+    "rawrefid": "reference_id", "rawid": "reference_id",
+    "indexid": "index_id", "index": "index_id", "entryid": "index_id",
+    "catalogueid": "index_id", "catalogid": "index_id",
+    "factkey": "fact_key", "key": "fact_key", "attribute": "fact_key",
+    "attr": "fact_key", "slot": "fact_key", "field": "fact_key", "fact": "fact_key",
+    "referencevalue": "reference_value", "refvalue": "reference_value",
+    "anchor": "reference_value", "anchorvalue": "reference_value",
+    "newvalue": "reference_value", "became": "reference_value",
+    "currentvalue": "reference_value",
+    "excludevalue": "exclude_value", "exclude": "exclude_value",
+    "except": "exclude_value", "oldvalue": "exclude_value", "othervalue": "exclude_value",
+    # "value" alone is read as the anchor (what the fact became), which is the
+    # useful meaning for a "before it became X" question.
+    "value": "reference_value",
+}
+
+#: Aliases whose meaning depends on the tool they are passed to.
+_AMBIGUOUS_ARGS = {
+    "id": {
+        TOOL_GET_RAW: "reference_id",
+        TOOL_GET_ARCHIVED: "summary_id",
+        TOOL_EXPAND_INDEX: "index_id",
+        TOOL_LIST_ACTIVE: "summary_id",
+    },
+    "reference": {
+        TOOL_GET_PREDECESSOR: "reference_value",
+        TOOL_GET_RAW: "reference_id",
+    },
+    "ref": {
+        TOOL_GET_PREDECESSOR: "reference_value",
+        TOOL_GET_RAW: "reference_id",
+    },
+}
+
+
 def normalise_tool_args(call: ToolCall) -> Dict[str, str]:
     """
-    Map the many argument names models invent onto the two canonical ones.
+    Map the many argument names models invent onto the canonical per-tool names.
 
-    ``get_archived_summary(summary_id=...)`` also accepts ``id``/``sid``;
-    ``get_raw_record(reference_id=...)`` also accepts ``ref``/``ref_id``/``id``.
+    Normalisation is **tool-aware**, because a few aliases are ambiguous:
+    ``reference`` is the raw-dialogue id for ``get_raw_record`` but the *anchor
+    value* for ``get_predecessor_summary``; ``id`` is a ``summary_id`` for the
+    archive tool but a ``reference_id`` for the raw tool.  A single flat table
+    silently routed the anchor into ``reference_id``, which degraded the history
+    lookup to "newest old value" -- exactly what the anchor mode exists to fix.
     """
+    tool = (call.name or "").strip().lower()
     out: Dict[str, str] = {}
     for key, value in call.args.items():
-        lowered = re.sub(r"[^a-z]", "", key.lower())
-        if lowered in ("summaryid", "sid", "summary", "id"):
-            out.setdefault("summary_id", value)
-        elif lowered in ("referenceid", "refid", "ref", "rawrefid", "reference", "rawid"):
-            out.setdefault("reference_id", value)
-        elif lowered in ("indexid", "index", "entryid", "catalogueid", "catalogid"):
-            out.setdefault("index_id", value)
-        elif lowered in ("factkey", "key", "attribute", "attr", "slot", "field", "fact"):
-            out.setdefault("fact_key", value)
-        elif lowered in ("referencevalue", "reference", "refvalue", "anchor", "anchorvalue",
-                          "newvalue", "became", "currentvalue"):
-            out.setdefault("reference_value", value)
-        elif lowered in ("excludevalue", "exclude", "except", "oldvalue", "othervalue"):
-            out.setdefault("exclude_value", value)
-        elif lowered in ("value",):
-            # "value" is ambiguous; treat it as the anchor (what the fact became),
-            # which is the more useful meaning for a "before it became X" question.
-            out.setdefault("reference_value", value)
-        else:
-            out.setdefault(key, value)
+        lowered = re.sub(r"[^a-z]", "", (key or "").lower())
+        canonical = None
+        if lowered in _AMBIGUOUS_ARGS:
+            canonical = _AMBIGUOUS_ARGS[lowered].get(tool)
+        if canonical is None:
+            canonical = _ARG_ALIASES.get(lowered)
+        if canonical is None:
+            canonical = key
+        out.setdefault(canonical, value)
     return out
 
 

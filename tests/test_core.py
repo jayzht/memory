@@ -126,6 +126,58 @@ class TestToolCallParsing(unittest.TestCase):
         )
         self.assertEqual(parse_tool_calls(echoed), [])
         self.assertEqual(strip_tool_echoes(echoed), "")
+        # ...including when the echoed line itself contains call grammar.
+        quoted = (
+            '[TOOL RESULT: get_archived_summary ERROR] use '
+            'get_archived_summary(summary_id="ep/s001@ab12cd")'
+        )
+        self.assertEqual(parse_tool_calls(quoted), [])
+
+    def test_full_width_punctuation_still_parses(self):
+        """
+        A Chinese-oriented prompt gets full-width punctuation back.
+
+        It used to produce *no* call at all: not counted as an attempt, and the
+        tool-call text became the final answer.
+        """
+        for text in (
+            'get_archived_summary(summary_id："ep/s001@ab12cd")',
+            'get_archived_summary（summary_id="ep/s001@ab12cd"）',
+            'get_raw_record（reference_id＝"ep/raw001@aaaaaa"）',
+        ):
+            calls = parse_tool_calls(text)
+            self.assertEqual(len(calls), 1, text)
+            args = normalise_tool_args(calls[0])
+            self.assertTrue(args.get("summary_id") or args.get("reference_id"), text)
+
+    def test_ambiguous_aliases_are_resolved_per_tool(self):
+        """
+        ``reference``/``id`` mean different things to different tools.
+
+        A flat alias table sent the history *anchor* into ``reference_id``, which
+        silently downgraded ``get_predecessor_summary`` to "newest old value".
+        """
+        anchor = normalise_tool_args(
+            parse_tool_calls('get_predecessor_summary(fact_key="楼层", reference="12楼")')[0]
+        )
+        self.assertEqual(anchor["reference_value"], "12楼")
+        self.assertNotIn("reference_id", anchor)
+
+        raw = normalise_tool_args(parse_tool_calls('get_raw_record(id="ep/raw001@aaaaaa")')[0])
+        self.assertEqual(raw["reference_id"], "ep/raw001@aaaaaa")
+
+        archived = normalise_tool_args(
+            parse_tool_calls('get_archived_summary(id="ep/s001@aaaaaa")')[0]
+        )
+        self.assertEqual(archived["summary_id"], "ep/s001@aaaaaa")
+
+    def test_two_overrides_tags_leave_no_tag_in_the_body(self):
+        parsed = parse_summary_response(
+            "Summary body.\n[FACTS: a=1]\n[OVERRIDES: s001]\n[OVERRIDES: s002]"
+        )
+        self.assertEqual(parsed["summary_text"], "Summary body.")
+        self.assertEqual(parsed["override_ids"], ["s001", "s002"])
+        self.assertEqual(parsed["fact_keys"], ["a=1"])
 
 
 class TestMemoryManagerOverrides(unittest.TestCase):
@@ -416,6 +468,52 @@ class TestAgentToolLoop(unittest.TestCase):
         self.assertEqual(run.tool_calls_attempted, 1)
         self.assertEqual(run.tool_calls_resolved, 0)
 
+    def test_tool_call_is_never_accepted_as_the_answer(self):
+        """
+        At the iteration cap a looping model offers a call as its "answer".
+
+        Accepting it put a call string into the prediction CSV, where the judge
+        scored it wrong for a harness reason rather than a memory reason.
+        """
+        from memory3l.agents import build_agent
+
+        store = InMemoryStore(recent_window_turns=2)
+        agent = build_agent(
+            "three_layer", store,
+            ScriptedLLM(['get_raw_record(reference_id="ep_loop/raw000@aaaaaa")'] * 12), None,
+        )
+        agent.reset_episode("ep_loop")
+        run = agent.answer("q")
+        self.assertTrue(run.tool_call_as_answer)
+        self.assertEqual(run.answer, "")
+        self.assertNotIn("get_raw_record", run.answer)
+
+    def test_tool_free_systems_are_not_told_to_call_tools(self):
+        """
+        Fairness: a system with no executor must not be given a tool manual.
+
+        Advertising tools to ``memgpt_style``/``naive_chain`` made the model emit a
+        call that could never execute; it fell through as the final answer and the
+        baseline was scored wrong although the value was in its own context.
+        """
+        from memory3l.agents import build_agent
+
+        store = InMemoryStore(recent_window_turns=2)
+        for name in ("memgpt_style", "naive_chain"):
+            agent = build_agent(name, store, ScriptedLLM(["answer"]), None)
+            agent.reset_episode(f"ep_ns_{name}")
+            system_content = agent.build_messages("q?")[0]["content"]
+            self.assertFalse(agent.supports_tools(), name)
+            self.assertNotIn("get_archived_summary", system_content, name)
+            self.assertNotIn("INDEX_LAYER", system_content, name)
+            self.assertNotIn("必须先调用工具", system_content, name)
+
+        ours = build_agent("three_layer", store, ScriptedLLM(["answer"]), None)
+        ours.reset_episode("ep_ns_ours")
+        ours_system = ours.build_messages("q?")[0]["content"]
+        self.assertTrue(ours.supports_tools())
+        self.assertIn("get_archived_summary", ours_system)
+
 
 class TestSelfWrittenMemory(unittest.TestCase):
     """
@@ -507,6 +605,51 @@ class TestSelfWrittenMemory(unittest.TestCase):
         self.assertIn("摘要", block)
         # no block at all
         self.assertEqual(split_selfwrite_reply("只是回答")[1], None)
+
+    def test_block_never_leaks_into_the_answer(self):
+        """Every delimiter variant must strip the machine payload from the answer."""
+        from memory3l.tools import split_selfwrite_reply
+
+        tag = "[OVERRIDES: none]"
+        cases = {
+            "only block": (
+                f"<MEMORY_UPDATE>\nfloor 3\n[FACTS: floor=3]\n{tag}\n</MEMORY_UPDATE>",
+                "floor 3",
+            ),
+            "two blocks": (
+                f"A\n<MEMORY_UPDATE>x1\n{tag}</MEMORY_UPDATE>\nmid\n"
+                f"<MEMORY_UPDATE>x2\n{tag}</MEMORY_UPDATE>",
+                "A",
+            ),
+            "closed fence": (f"answer\n```memory_update\nq\n{tag}\n```", "answer"),
+            "unclosed fence": (f"answer\n```memory_update\nq\n{tag}", "answer"),
+            "unclosed tag": (f"answer\n<MEMORY_UPDATE>\nq\n{tag}", "answer"),
+            "lowercase tag": (f"answer\n<memory_update>q\n{tag}</memory_update>", "answer"),
+        }
+        for name, (text, expected_start) in cases.items():
+            visible, block = split_selfwrite_reply(text)
+            self.assertTrue(block, f"{name}: block not extracted")
+            self.assertNotIn("MEMORY_UPDATE", visible.upper(), f"{name}: tag leaked")
+            self.assertNotIn("[OVERRIDES", visible.upper(), f"{name}: tag leaked")
+            self.assertTrue(
+                visible.startswith(expected_start),
+                f"{name}: answer body lost (got {visible!r})",
+            )
+
+    def test_prose_mention_is_not_a_block(self):
+        """
+        A sentence that merely *names* the marker must not truncate the answer.
+
+        The unclosed-tag form is only trusted when the remainder carries the
+        summary grammar, otherwise "the tag <MEMORY_UPDATE> means ..." would be
+        harvested as memory and the real answer deleted.
+        """
+        from memory3l.tools import split_selfwrite_reply
+
+        text = "The tag <MEMORY_UPDATE> is used to record memory; the answer is 3F."
+        visible, block = split_selfwrite_reply(text)
+        self.assertIsNone(block)
+        self.assertEqual(visible, text)
 
 
 if __name__ == "__main__":

@@ -74,22 +74,20 @@ class ThreeLayerAgent(BaseAgent):
 
     # ------------------------------------------------------------------ #
     def build_messages(self, question: str) -> List[Dict[str, str]]:
+        return self.context_messages(question)
+
+    def context_messages(self, question: str, selfwrite: bool = False) -> List[Dict[str, str]]:
         return build_agent_messages(
             self.manager.get_window(),
             self.manager.chain_summaries(),      # only unfiled summaries are rendered
             question,
             recent_window_turns=self.recent_window_turns,
             indexes=self.manager.rendered_index_entries(),
-        )
-
-    def context_messages(self, question: str, selfwrite: bool = False) -> List[Dict[str, str]]:
-        return build_agent_messages(
-            self.manager.get_window(),
-            self.manager.chain_summaries(),
-            question,
-            recent_window_turns=self.recent_window_turns,
-            indexes=self.manager.rendered_index_entries(),
             selfwrite=selfwrite,
+            # three_layer always has an executor once an episode is bound, but the
+            # flag is threaded explicitly so the prompt can never advertise tools
+            # the agent cannot run.
+            tools_available=self.supports_tools(),
         )
 
     def answer_and_remember(self, question: str):
