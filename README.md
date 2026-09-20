@@ -40,6 +40,16 @@
 
 ## 1. 快速开始
 
+**只用记忆功能、不看实验？** 直接看 [`INTEGRATION.md`](INTEGRATION.md)（把记忆接进你自己的 agent）
+和 [`examples/agent_with_memory.py`](examples/agent_with_memory.py)（可直接运行）：
+
+```bash
+python3 examples/agent_with_memory.py                     # 离线，不需要 API key
+python3 examples/agent_with_memory.py --backend deepseek  # 真实行为
+```
+
+下面是跑**实验/评测**的用法。
+
 ```bash
 pip install -r requirements.txt          # 必需：requests；可选：redis, tiktoken, openai, datasets
 
