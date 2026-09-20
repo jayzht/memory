@@ -208,7 +208,8 @@ class BaseAgent(abc.ABC):
                 result.tool_calls_attempted += 1
                 result.tool_calls_failed += 1
                 result.tool_call_log.append(
-                    {"name": "<unparsable>", "ok": False, "error": "unparsable tool intent", "raw": text[:200]}
+                    {"name": "<unparsable>", "ok": False, "parsed": False,
+                     "error": "unparsable tool intent", "raw": text[:200]}
                 )
                 self._record_step(result, iteration, "unparsable_tool_intent", text, [])
                 messages = build_tool_followup_messages(
@@ -316,6 +317,7 @@ class BaseAgent(abc.ABC):
                     "name": call.name,
                     "args": call.args,
                     "ok": bool(tool_result.ok and tool_result.resolved),
+                    "parsed": bool(tool_result.parsed),
                     "error": tool_result.error,
                     "raw": call.raw[:200],
                 }

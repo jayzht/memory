@@ -16,7 +16,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from memory3l.dataset import build_synthetic_episodes
+from memory3l.dataset import build_synthetic_episodes, HISTORY_FACT
 from memory3l.llm import HeuristicLLM, ScriptedLLM
 from memory3l.memory_manager import MemoryManager
 from memory3l.models import ActiveSummary, ArchivedSummary, RawDialogRecord
@@ -472,6 +472,84 @@ class TestIndexHierarchy(unittest.TestCase):
         store.add_active_summary(actives[0], episode_id="ep_idx")
         rendered = {s.summary_id for s in manager.chain_summaries()}
         self.assertNotIn(actives[0].summary_id, rendered)
+
+
+class TestAnswerMatching(unittest.TestCase):
+    """The string judge must not accept a mention of the gold as the answer."""
+
+    def test_strict_matching(self):
+        from evaluation import string_match
+
+        for prediction, gold in (
+            ("Paris", "Paris"),
+            ("Paris.", "Paris"),
+            ("答案是 Paris", "Paris"),
+            ("(b) sushi", "sushi"),
+            ("sushi", "(b) sushi"),
+        ):
+            self.assertTrue(string_match(prediction, gold), (prediction, gold))
+
+    def test_mentioning_the_gold_is_not_an_answer(self):
+        """
+        The old containment rule accepted the gold anywhere in a prediction up to 4x
+        its length, so a verbose answer asserting a *different* value was scored
+        correct without ever reaching the LLM judge -- exactly what strict matching
+        exists to prevent.
+        """
+        from evaluation import string_match
+
+        for prediction, gold in (
+            ("It is now Shanghai, but originally it was Paris.", "Paris"),
+            ("The current value is Beijing (previously Paris).", "Paris"),
+            ("Beijing", "Paris"),
+            ("I think the answer might be Shanghai, not Paris", "Paris"),
+        ):
+            self.assertFalse(string_match(prediction, gold), (prediction, gold))
+
+
+class TestSyntheticProbes(unittest.TestCase):
+    """
+    The synthetic dataset is the cheap smoke path, so its gold answers must be right.
+
+    ``build_synthetic_episodes`` anchored every history probe on the episode-FINAL
+    value, so an attribute that changed twice produced two probes with the same
+    wording ("before it became <latest>") and different gold answers.  Only one can
+    be correct, so a correct lookup was scored wrong.
+    """
+
+    def test_history_probes_are_anchored_on_the_next_value(self):
+        import re
+
+        from memory3l.dataset import build_synthetic_episodes
+
+        for language, pattern in (("zh", r"改成(.+?)之前"), ("en", r"became (.+?),")):
+            episodes = build_synthetic_episodes(
+                num_episodes=4, turns_per_episode=12, seed=11, language=language
+            )
+            for episode in episodes:
+                seen = {}
+                for probe in episode.probes:
+                    key = (probe.fact_key, probe.question)
+                    if key in seen:
+                        self.assertEqual(
+                            seen[key], probe.answer,
+                            f"{language}: same question, different gold: {probe.question!r}",
+                        )
+                    seen[key] = probe.answer
+
+                    if probe.probe_type != HISTORY_FACT:
+                        continue
+                    timeline = [value for _turn, value in episode.facts.get(probe.fact_key, [])]
+                    match = re.search(pattern, probe.question)
+                    self.assertIsNotNone(match, probe.question)
+                    successor = match.group(1)
+                    self.assertIn(successor, timeline, probe.question)
+                    position = timeline.index(successor)
+                    self.assertGreater(position, 0, probe.question)
+                    self.assertEqual(
+                        timeline[position - 1], probe.answer,
+                        f"{language}: gold is not the value immediately before {successor!r}",
+                    )
 
 
 class TestHeuristicPipeline(unittest.TestCase):

@@ -114,36 +114,59 @@ def normalise_answer(text: str) -> str:
     return value
 
 
+#: Short lead-ins a model puts in front of its answer.  Stripping them lets the
+#: gold be tested as a *prefix* without accepting it anywhere in a verbose reply.
+_ANSWER_LEAD_RE = re.compile(
+    r"^(?:the\s+answer\s+is|final\s+answer|answer\s*[:：]|答案是?|答案\s*[:：]|it\s+is|是)\s*[:：]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _answer_head(text: str) -> str:
+    previous = None
+    current = (text or "").strip()
+    while current != previous:
+        previous = current
+        current = _ANSWER_LEAD_RE.sub("", current).strip()
+    return current
+
+
 def string_match(prediction: str, gold: str) -> bool:
     """
-    Exact / containment match after normalisation, with option-letter awareness.
+    Exact match, or the prediction *leads with* the gold, after normalisation.
 
-    Deliberately strict: a wrong value that merely mentions the right entity is
-    *not* a match, because that is precisely the failure mode History_Fact_Acc
-    is meant to catch (answering the current value to a question about the old
-    one).
+    Strict on purpose: a wrong value that merely mentions the right entity must not
+    be a match, because that is exactly the failure mode History_Fact_Acc exists to
+    catch (answering the current value to a question about the old one).  The
+    previous version accepted the gold anywhere inside a prediction up to 4x its
+    length, which let a verbose answer that asserted a different value pass without
+    ever reaching the LLM judge.
     """
     pred = normalise_answer(prediction)
     target = normalise_answer(gold)
-    if not target:
-        return False
-    if not pred:
+    if not target or not pred:
         return False
     if pred == target:
         return True
+
+    pred_head = _answer_head(pred)
+    target_head = _answer_head(target)
+    if pred_head == target_head:
+        return True
+
     # Multiple choice: gold "(b) sushi" vs prediction "(b)" or "sushi".
-    target_body = re.sub(r"^\(?[a-d]\)?", "", target)
-    pred_body = re.sub(r"^\(?[a-d]\)?", "", pred)
+    target_body = re.sub(r"^\(?[a-d]\)?\s*", "", target_head).strip()
+    pred_body = re.sub(r"^\(?[a-d]\)?\s*", "", pred_head).strip()
     if target_body and pred_body:
         if target_body == pred_body:
             return True
-        # Containment, but never when the prediction contains BOTH the option
-        # letter of a different choice and a different body.
-        if len(target_body) >= 2 and target_body in pred_body:
+        if pred_body.startswith(target_body):
             return True
-        if len(pred_body) >= 2 and pred_body in target_body:
-            return True
-    if len(target) >= 3 and target in pred and len(pred) <= len(target) * 4:
+
+    # The answer must come first; trailing prose is fine, leading prose is not.
+    if len(target) >= 2 and pred_head.startswith(target):
+        return True
+    if len(target_head) >= 2 and pred_head.startswith(target_head):
         return True
     return False
 
@@ -773,6 +796,12 @@ def aggregate(rows: Sequence[EpisodeResult]) -> List[Dict[str, Any]]:
         current_correct = sum(i.current_correct for i in items)
         history_total = sum(i.history_total for i in items)
         history_correct = sum(i.history_correct for i in items)
+        # MEMORY_POINT probes (retrieved-content questions) were accumulated per
+        # episode but never aggregated, so a system that executed every tool call and
+        # still answered the archived-content question wrongly lost nothing in the
+        # headline table.
+        other_total = sum(i.other_total for i in items)
+        other_correct = sum(i.other_correct for i in items)
         tool_attempted = sum(i.tool_attempted for i in items)
         tool_resolved = sum(i.tool_resolved for i in items)
         tool_parsed = sum(i.tool_parsed for i in items)
@@ -791,6 +820,8 @@ def aggregate(rows: Sequence[EpisodeResult]) -> List[Dict[str, Any]]:
                 "Current_Fact_n": current_total,
                 "History_Fact_Acc": round(history_correct / history_total, 4) if history_total else "",
                 "History_Fact_n": history_total,
+                "Memory_Point_Acc": round(other_correct / other_total, 4) if other_total else "",
+                "Memory_Point_n": other_total,
                 "Avg_Active_Chain_Tokens": round(statistics.fmean(chain_tokens), 2) if chain_tokens else "",
                 "Avg_Active_Chain_Tokens_rendered": (
                     round(statistics.fmean(chain_tokens_rendered), 2) if chain_tokens_rendered else 0.0
@@ -1185,19 +1216,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         run_id, system, scoped,
                         {**result.to_row(), "_probes": [p.to_row() for p in probes]},
                     )
-                    cold.mark_episode_done(
-                        scoped,
-                        run_id=f"{run_id}::{system}",
-                        num_turns=result.num_turns,
-                        detail=json.dumps(
-                            {
-                                "current_acc": result.current_correct / result.current_total if result.current_total else None,
-                                "history_acc": result.history_correct / result.history_total if result.history_total else None,
-                                "active_chain_tokens_mean": result.active_chain_text_tokens_mean,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
+                    if result.error:
+                        # Partially ingested: it is scored here (the data may still be
+                        # usable) but must NOT be checkpointed as done, or a resume
+                        # would skip it and the run would silently keep a bad row.
+                        failed += 1
+                        cold.mark_episode_failed(
+                            scoped, run_id=f"{run_id}::{system}", detail=result.error,
+                        )
+                        logger.warning(
+                            "%s finished with an error and will be retried on resume: %s",
+                            log_prefix, result.error,
+                        )
+                    else:
+                        cold.mark_episode_done(
+                            scoped,
+                            run_id=f"{run_id}::{system}",
+                            num_turns=result.num_turns,
+                            detail=json.dumps(
+                                {
+                                    "current_acc": result.current_correct / result.current_total if result.current_total else None,
+                                    "history_acc": result.history_correct / result.history_total if result.history_total else None,
+                                    "active_chain_tokens_mean": result.active_chain_text_tokens_mean,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
 
             # flush after each system so an interruption keeps completed work.
             # ``append=False``: ``all_rows`` is cumulative, so appending it again on

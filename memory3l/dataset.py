@@ -509,10 +509,16 @@ def build_synthetic_episodes(
                 )
             for index in range(len(entries) - 1):
                 old_value = entries[index][1]
+                # Anchor on the *next* value in this attribute's own timeline, not on
+                # the episode-final value.  Anchoring on the final value emitted one
+                # probe per transition with identical wording but different gold
+                # ("before it became 12th -> 3rd" AND "... -> 7th"), so the question
+                # was unanswerable and a correct lookup was scored wrong.
+                next_value = entries[index + 1][1]
                 if language == "zh":
                     probes.append(
                         Probe(
-                            question=f"在改成{latest_value}之前，我的{attr}原来是什么？",
+                            question=f"在改成{next_value}之前，我的{attr}原来是什么？",
                             answer=old_value,
                             probe_type=HISTORY_FACT,
                             fact_key=attr,
@@ -522,7 +528,7 @@ def build_synthetic_episodes(
                 else:
                     probes.append(
                         Probe(
-                            question=f"Before it became {latest_value}, what was my {attr}?",
+                            question=f"Before it became {next_value}, what was my {attr}?",
                             answer=old_value,
                             probe_type=HISTORY_FACT,
                             fact_key=attr,

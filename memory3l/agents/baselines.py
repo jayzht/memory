@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Sequence
 from ..llm import LLMError
 from ..models import RawDialogRecord, make_id, now_ts
 from ..prompts import build_agent_messages, build_full_context_messages, insert_after_recent_window
-from ..token_utils import estimate_tokens
+from ..token_utils import count_message_tokens, estimate_tokens
 from .base_agent import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -65,13 +65,14 @@ class FullContextAgent(BaseAgent):
         )
         self.store.add_raw_record(record, episode_id=self.episode_id)
         self.store.append_window_record(record, episode_id=self.episode_id)
-        # Context size this system actually carries = the whole raw history.
-        self.turn_tokens.append(
-            sum(
-                estimate_tokens(r.user_msg) + estimate_tokens(r.agent_msg)
-                for r in self.store.list_raw_records(self.episode_id)
-            )
+        # Context size this system actually *renders* for the history so far, which
+        # is the truncated one.  Reporting the untruncated stored total (as before)
+        # over-stated the baseline's cost on every episode past the budget, which is
+        # exactly the regime where the cost comparison matters.
+        rendered = build_full_context_messages(
+            self.store.list_raw_records(self.episode_id), "", max_tokens=self.raw_context_token_limit
         )
+        self.turn_tokens.append(count_message_tokens(rendered))
         return {"turn_index": self.turn_index, "raw_ref_id": raw_ref_id}
 
     def build_messages(self, question: str) -> List[Dict[str, str]]:
@@ -80,19 +81,24 @@ class FullContextAgent(BaseAgent):
 
     def finalize_episode(self) -> Dict[str, Any]:
         records = self.store.list_raw_records(self.episode_id)
-        tokens = sum(estimate_tokens(r.user_msg) + estimate_tokens(r.agent_msg) for r in records)
+        stored_tokens = sum(
+            estimate_tokens(r.user_msg) + estimate_tokens(r.agent_msg) for r in records
+        )
+        # Per-turn mean of the context actually rendered, so this column means the
+        # same thing for every system (see README "metric definitions").
+        rendered_mean = (
+            sum(self.turn_tokens) / len(self.turn_tokens) if self.turn_tokens else 0.0
+        )
         return {
             "system": self.system_name,
             "num_turns": self.turn_index + 1,
-            "context_raw_tokens": tokens,
-            # The baseline's "memory" IS the raw context, so report that as the
-            # comparable chain-token figure (see README metrics caveat).
-            "active_chain_tokens": tokens,
-            # Comparable metric keys (documented in the README): the chain figure
-            # is the raw context itself for this baseline.
-            "avg_active_chain_tokens": tokens,
-            "avg_active_chain_tokens_rendered": tokens,
-            "avg_context_tokens": tokens,
+            "context_raw_tokens": stored_tokens,
+            # The baseline's "memory" IS the raw context, so the comparable chain
+            # figure is the rendered context (post-truncation), averaged per turn.
+            "active_chain_tokens": rendered_mean,
+            "avg_active_chain_tokens": rendered_mean,
+            "avg_active_chain_tokens_rendered": rendered_mean,
+            "avg_context_tokens": rendered_mean,
             "archived_count": 0,
         }
 
@@ -162,7 +168,10 @@ class MemGPTStyleAgent(BaseAgent):
         verbatim_tokens = sum(estimate_tokens(r.user_msg) + estimate_tokens(r.agent_msg) for r in all_records)
         if verbatim_tokens <= self.raw_context_token_limit:
             return
-        to_evict = all_records[: max(1, len(all_records) - self.recent_window_turns)]
+        # Keep exactly the newest ``recent_window_turns`` records.  The old
+        # ``max(1, ...)`` evicted one record even when the history was already
+        # shorter than the window, contradicting the docstring.
+        to_evict = all_records[: max(0, len(all_records) - self.recent_window_turns)]
         if not to_evict:
             return
         turn_text = "\n".join(f"user: {r.user_msg}\nagent: {r.agent_msg}" for r in to_evict)
@@ -259,6 +268,8 @@ class NaiveChainAgent(BaseAgent):
         self.chain: List[Dict[str, Any]] = []
         self.dropped = 0
         self.turn_tokens: List[int] = []
+        #: chain-body tokens per turn (the column that is comparable with three_layer)
+        self.turn_chain_tokens: List[int] = []
 
     def reset_episode(self, episode_id: str, *, resume: bool = False) -> None:
         self.episode_id = episode_id
@@ -266,6 +277,7 @@ class NaiveChainAgent(BaseAgent):
         self.chain = []
         self.dropped = 0
         self.turn_tokens = []
+        self.turn_chain_tokens = []
         self.store.bind_episode(
             episode_id, recent_window_turns=self.recent_window_turns, reset=True
         )
@@ -308,8 +320,10 @@ class NaiveChainAgent(BaseAgent):
             text = text[: text.upper().index("[OVERRIDES")].strip()
         self.chain.append({"turn": self.turn_index, "text": text, "raw_ref_id": raw_ref_id})
         self._trim()
+        chain_body_tokens = estimate_tokens(" ".join(c["text"] for c in self.chain))
+        self.turn_chain_tokens.append(chain_body_tokens)
         self.turn_tokens.append(
-            estimate_tokens(" ".join(c["text"] for c in self.chain))
+            chain_body_tokens
             + sum(
                 estimate_tokens(r.user_msg) + estimate_tokens(r.agent_msg)
                 for r in self.store.get_window(self.episode_id)
@@ -350,7 +364,13 @@ class NaiveChainAgent(BaseAgent):
             "archived_count": 0,
             "active_chain_size": len(self.chain),
             "active_chain_tokens": chain_tokens,
-            "avg_active_chain_tokens": chain_tokens,
+            # Same definition as three_layer's column: per-turn mean of the summary
+            # *bodies* the system carries.  Reporting the end-of-episode total here
+            # compared a final state against a per-turn mean.
+            "avg_active_chain_tokens": (
+                sum(self.turn_chain_tokens) / len(self.turn_chain_tokens)
+                if self.turn_chain_tokens else 0.0
+            ),
             "avg_active_chain_tokens_rendered": (
                 sum(self.turn_tokens) / len(self.turn_tokens) if self.turn_tokens else 0.0
             ),
