@@ -18,7 +18,7 @@ back to the configuration that produced it.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from typing import Optional
 
 # --------------------------------------------------------------------------- #
@@ -333,3 +333,24 @@ class ConfigSnapshot:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_args(cls, args, **overrides) -> "ConfigSnapshot":
+        """
+        Build the snapshot from parsed CLI arguments.
+
+        Constructing it with a handful of explicit fields left every other override
+        (``--raw-context-token-limit``, ``--max-tool-iterations``, ``--sqlite-path``,
+        the capacity/index knobs, ``--lazy-mode``, ...) recorded as its *default*,
+        so a completed run's metadata did not describe the run that produced it.
+        Any argument that is ``None`` falls back to the config value.
+        """
+        values = {}
+        for spec in fields(cls):
+            if spec.name == "extra":
+                continue
+            value = getattr(args, spec.name, None)
+            if value is not None:
+                values[spec.name] = value
+        values.update(overrides)
+        return cls(**values)

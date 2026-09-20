@@ -146,11 +146,15 @@ def record_to_episode(
             answer_positions = [len(sessions) - 1] if sessions else []
         budget = max_turns
         used: set = set()
+        # The budget is in *turns* (what the memory system ingests), so cost each
+        # session by the number of turns it produces, not by its message count.  The
+        # old message-based accounting under-spent the budget by ~2x.
+        turn_cost = [len(sessions_to_dialogues([session])) for session in sessions]
         # 1) evidence first
         for pos in answer_positions:
             if pos in used or pos >= len(sessions):
                 continue
-            cost = len(sessions[pos])
+            cost = turn_cost[pos]
             if cost > budget and used:
                 continue
             selected_indices.append(pos); used.add(pos); budget -= cost
@@ -160,7 +164,7 @@ def record_to_episode(
                 break
             if pos in used:
                 continue
-            cost = len(sessions[pos])
+            cost = turn_cost[pos]
             if cost > budget and selected_indices:
                 continue
             selected_indices.append(pos); used.add(pos); budget -= cost
@@ -169,11 +173,40 @@ def record_to_episode(
         selected_indices = list(range(len(sessions)))
 
     selected = [sessions[i] for i in selected_indices]
-    dialogues = sessions_to_dialogues(selected)
+    # Tag every turn with whether it came from an evidence session *before*
+    # flattening: the turn-level cut below must protect the gold, and a plain
+    # suffix cut cannot tell which turns those are.
+    per_session_turns = [sessions_to_dialogues([session]) for session in selected]
+    evidence_flags = [
+        session_ids[pos] in answer_sessions if pos < len(session_ids) else False
+        for pos in selected_indices
+    ]
+    dialogues = [turn for turns in per_session_turns for turn in turns]
+    turn_is_evidence = [
+        flag for turns, flag in zip(per_session_turns, evidence_flags) for _ in turns
+    ]
     if max_turns is not None and max_turns > 0 and len(dialogues) > max_turns:
-        # Keep the *newest* turns plus everything from the evidence session: a hard
-        # prefix cut would drop the answer.
-        dialogues = dialogues[-max_turns:]
+        # Keep every evidence turn, then fill the remaining budget with the newest
+        # other turns.  The previous `dialogues[-max_turns:]` cut the *newest* turns
+        # only, which silently deleted earlier turns of a long evidence session while
+        # ``answer_session_included`` (computed before the cut) still claimed it was
+        # kept -- the question became unanswerable for a reason unrelated to memory.
+        kept = [i for i, is_evidence in enumerate(turn_is_evidence) if is_evidence]
+        keep_set = set(kept)
+        for i in range(len(dialogues) - 1, -1, -1):
+            if len(kept) >= max_turns:
+                break
+            if i not in keep_set:
+                kept.append(i)
+                keep_set.add(i)
+        ordered = sorted(keep_set)
+        if len(ordered) > max_turns:
+            # Evidence alone exceeds the budget: keep its newest turns.
+            ordered = ordered[-max_turns:]
+        dialogues = [dialogues[i] for i in ordered]
+        kept_evidence = [i for i in ordered if turn_is_evidence[i]]
+    else:
+        kept_evidence = [i for i, is_evidence in enumerate(turn_is_evidence) if is_evidence]
 
     question = str(record.get("question", "") or "")
     answer = record.get("answer")
@@ -209,12 +242,16 @@ def record_to_episode(
             "question_type": record.get("question_type"),
             "num_sessions": len(sessions),
             "num_sessions_kept": len(selected),
-            "full_turns": sum(len(s) for s in sessions),
+            # Turns, not messages: ``kept_turns`` counts turn pairs, so mixing units
+            # here made "kept vs full" incomparable.
+            "full_turns": len(sessions_to_dialogues(sessions)),
             "kept_turns": len(dialogues),
             "truncated": max_turns is not None and len(selected) < len(sessions),
-            "answer_session_included": any(
-                session_ids[i] in answer_sessions for i in selected_indices
-            ) if answer_sessions else None,
+            # Computed from the turns that actually survived the cut, not from the
+            # pre-cut session selection.
+            "answer_session_included": (
+                bool(kept_evidence) if answer_sessions else None
+            ),
         },
     )
 
@@ -226,10 +263,13 @@ def load_longmemeval(
     types: Optional[Sequence[str]] = None,
 ) -> List[Episode]:
     """
-    Load ``limit`` LongMemEval questions as episodes.
+    Load LongMemEval questions as episodes.
 
-    ``types`` filters question types (e.g. ``["knowledge-update"]``); filtering
-    happens *after* streaming, so ``limit`` counts scanned records, not matches.
+    ``types`` filters question types (e.g. ``["knowledge-update"]``) and ``limit``
+    counts *matching episodes*, not scanned records.  The old behaviour capped the
+    scan first and filtered afterwards, so ``--lme-types knowledge-update --limit
+    50`` returned ZERO episodes (the first 50 records are all
+    ``single-session-user``) -- silently, since a small dataset looks normal.
     """
     path = path or DEFAULT_PATH
     if not os.path.exists(path):
@@ -241,14 +281,27 @@ def load_longmemeval(
             "longmemeval_s_cleaned.json"
         )
     wanted = set(types) if types else None
+    # A filter has to scan past non-matching records, so the record cap is derived
+    # from the episode cap (and is generous) rather than equal to it.
+    scan_cap = None if not limit else max(limit * 50, 500)
     episodes: List[Episode] = []
     type_counts: Counter = Counter()
-    for index, record in enumerate(_iter_raw(path, limit)):
+    scanned = 0
+    for index, record in enumerate(_iter_raw(path, scan_cap)):
+        scanned = index + 1
         qtype = str(record.get("question_type", ""))
         type_counts[qtype] += 1
         if wanted and qtype not in wanted:
             continue
         episodes.append(record_to_episode(record, index, max_turns=max_turns))
+        if limit is not None and len(episodes) >= limit:
+            break
+    if limit is not None and len(episodes) < limit and scan_cap is not None and scanned >= scan_cap:
+        logger.warning(
+            "LongMemEval: scanned the %d-record cap and found only %d matching "
+            "episode(s) (sought %d); raise --limit or drop --lme-types",
+            scanned, len(episodes), limit,
+        )
     logger.info(
         "LongMemEval: %d episodes (of %d scanned) | types: %s | max_turns=%s",
         len(episodes), sum(type_counts.values()), dict(type_counts), max_turns,

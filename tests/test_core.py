@@ -507,6 +507,115 @@ class TestAnswerMatching(unittest.TestCase):
             self.assertFalse(string_match(prediction, gold), (prediction, gold))
 
 
+class TestLongMemEvalAdapter(unittest.TestCase):
+    """
+    The adapter decides what a "question" even is, so its truncation and filtering
+    must not silently make a question unanswerable or return nothing at all.
+    """
+
+    @staticmethod
+    def _record():
+        def session(prefix, pairs):
+            messages = []
+            for i in range(pairs):
+                messages.append({"role": "user", "content": f"{prefix} u{i}"})
+                messages.append({"role": "assistant", "content": f"{prefix} a{i}"})
+            return messages
+
+        return {
+            "question_id": "q1",
+            "question": "Where did I go on my most recent family trip?",
+            "answer": "Paris",
+            "question_type": "knowledge-update",
+            "haystack_session_ids": ["s_ev", "s2", "s3"],
+            "answer_session_ids": ["s_ev"],
+            # the evidence is the OLDEST session and the longest
+            "haystack_sessions": [session("EVID", 10), session("b", 5), session("c", 5)],
+        }
+
+    def test_truncation_keeps_the_evidence_turns(self):
+        from memory3l.longmemeval import record_to_episode
+
+        episode = record_to_episode(self._record(), 0, max_turns=6)
+        self.assertEqual(episode.meta["kept_turns"], 6)
+        self.assertTrue(episode.meta["answer_session_included"])
+        transcript = " ".join(user for user, _agent in episode.dialogues)
+        self.assertIn("EVID", transcript, "the evidence turns were cut away")
+
+    def test_evidence_survives_even_when_it_exceeds_the_budget(self):
+        from memory3l.longmemeval import record_to_episode
+
+        episode = record_to_episode(self._record(), 0, max_turns=4)
+        transcript = " ".join(user for user, _agent in episode.dialogues)
+        self.assertIn("EVID", transcript)
+        self.assertTrue(episode.meta["answer_session_included"])
+
+    def test_no_truncation_keeps_everything(self):
+        from memory3l.longmemeval import record_to_episode
+
+        episode = record_to_episode(self._record(), 0, max_turns=None)
+        self.assertEqual(episode.meta["kept_turns"], episode.meta["full_turns"])
+        self.assertTrue(episode.meta["answer_session_included"])
+
+    def test_type_filter_counts_matches_not_scanned_records(self):
+        """
+        Filtering used to happen after a hard record cap, so
+        ``types=['knowledge-update'], limit=50`` returned ZERO episodes when the
+        matching records sat beyond the first 50 (they all do, in the real file).
+        """
+        import json
+        import tempfile
+
+        from memory3l.longmemeval import load_longmemeval
+
+        def record(qid, qtype):
+            return {
+                "question_id": qid, "question": f"q {qid}", "answer": "a",
+                "question_type": qtype,
+                "haystack_session_ids": ["s1"], "answer_session_ids": ["s1"],
+                "haystack_sessions": [[
+                    {"role": "user", "content": "u"}, {"role": "assistant", "content": "a"},
+                ]],
+            }
+
+        records = [record(f"n{i}", "single-session-user") for i in range(60)]
+        records.append(record("k1", "knowledge-update"))
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "lme.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(records, handle)
+
+        episodes = load_longmemeval(path=path, limit=1, types=["knowledge-update"])
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(episodes[0].meta["question_type"], "knowledge-update")
+
+
+class TestProbeTypeInference(unittest.TestCase):
+    def test_current_questions_are_not_mislabelled_as_history(self):
+        """
+        A substring test for "was" labelled "What was the meeting time?" as a history
+        probe, and an unlabelled probe with no marker became OTHER -- which is in
+        neither headline metric, so it silently vanished from the report.
+        """
+        from memory3l.dataset import _normalise_probe_type
+
+        cases = [
+            ("What was the meeting time?", "9am", "current_fact"),
+            ("What is my office floor now?", "3rd", "current_fact"),
+            ("Where do I work in Washington?", "DC", "current_fact"),
+            ("Before it became 12th, what was my office floor?", "3rd", "history_fact"),
+            ("What was my office floor previously?", "3rd", "history_fact"),
+            ("在改成12楼之前，我的工位是什么？", "3楼", "history_fact"),
+            ("我现在的工位是什么？", "12楼", "current_fact"),
+        ]
+        for question, gold, expected in cases:
+            self.assertEqual(
+                _normalise_probe_type(None, question, has_answer=bool(gold)),
+                expected,
+                question,
+            )
+
+
 class TestSyntheticProbes(unittest.TestCase):
     """
     The synthetic dataset is the cheap smoke path, so its gold answers must be right.

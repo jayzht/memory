@@ -157,7 +157,24 @@ def _coerce_dialogue(item: Any) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _normalise_probe_type(raw: Any, question: str = "") -> str:
+#: Explicit history markers, matched on word boundaries.  A plain substring test for
+#: "was" also fired on "What was the meeting time?" -- a *current-value* question in
+#: the past tense -- and on words like "Washington", mislabelling probes and moving
+#: them between the two headline metrics.
+_HISTORY_MARKERS = (
+    r"\bbefore\b", r"\bpreviously\b", r"\bused to\b", r"\boriginally\b",
+    r"\bearlier\b", r"\bprior to\b", r"\bformerly\b", r"\bold value\b",
+    r"以前", r"之前", r"原来", r"原先",
+)
+_CURRENT_MARKERS = (
+    r"\bnow\b", r"\bcurrently\b", r"\bcurrent\b", r"\blatest\b", r"\bthese days\b",
+    r"现在", r"目前", r"当前",
+)
+_HISTORY_RE = re.compile("|".join(_HISTORY_MARKERS), re.IGNORECASE)
+_CURRENT_RE = re.compile("|".join(_CURRENT_MARKERS), re.IGNORECASE)
+
+
+def _normalise_probe_type(raw: Any, question: str = "", has_answer: bool = False) -> str:
     text = str(raw or "").strip().lower()
     if text in ("current_fact", "current", "currentfact", "now", "latest"):
         return CURRENT_FACT
@@ -167,10 +184,21 @@ def _normalise_probe_type(raw: Any, question: str = "") -> str:
         return MEMORY_POINT
     if text:
         return text
-    # Infer from the question text when the dataset does not label probes.
-    lowered = question.lower()
-    if any(token in lowered for token in ("before", "previously", "used to", "originally", "was", "earlier", "以前", "之前", "原来")):
+    # Infer from the question text when the dataset does not label probes.  History
+    # is checked first because "before it became X" also contains "became"/"now"-like
+    # wording less often than the reverse.
+    if _HISTORY_RE.search(question):
         return HISTORY_FACT
+    if _CURRENT_RE.search(question):
+        return CURRENT_FACT
+    # An unlabelled probe that carries a gold answer is overwhelmingly a
+    # current-value question; leaving it as OTHER silently removed it from BOTH
+    # headline metrics (OTHER probes are not aggregated into either).
+    if has_answer:
+        logger.info(
+            "probe type inferred as current_fact (no label, no marker): %r", str(question)[:80]
+        )
+        return CURRENT_FACT
     return OTHER
 
 
@@ -197,7 +225,9 @@ def _coerce_probe(item: Any, index: int) -> Optional[Probe]:
     if isinstance(answer, list):
         answer = answer[0] if answer else ""
     probe_type = _normalise_probe_type(
-        item.get("type") or item.get("probe_type") or item.get("category"), str(question)
+        item.get("type") or item.get("probe_type") or item.get("category"),
+        str(question),
+        has_answer=bool(str(answer).strip()),
     )
     return Probe(
         question=str(question),

@@ -924,7 +924,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="turns per episode for the long synthetic set")
     parser.add_argument("--synthetic-language", default="zh", choices=["zh", "en"],
                         help="language of generated synthetic dialogue")
-    parser.add_argument("--limit", type=int, default=0, help="max episodes (0 = all)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="max episodes (0 = all; omit for the per-format default)")
     parser.add_argument("--seed", type=int, default=config.SEED, help="synthetic data / sampling seed")
     parser.add_argument("--inspect", action="store_true", help="print the dataset schema and exit")
     # systems
@@ -1014,9 +1015,13 @@ def resolve_dataset(args: argparse.Namespace) -> List[Episode]:
         from memory3l.longmemeval import load_longmemeval
 
         types = [t.strip() for t in (args.lme_types or "").split(",") if t.strip()] or None
+        # ``--limit`` counts *matching* episodes now (it previously capped the scan
+        # first, so a type filter returned nothing).  No flag = the 50-episode pilot
+        # default; ``--limit 0`` = every matching episode.
+        lme_limit = 50 if args.limit is None else (None if args.limit == 0 else args.limit)
         return load_longmemeval(
             path=args.lme_path,
-            limit=args.limit or 50,
+            limit=lme_limit,
             max_turns=args.lme_max_turns or None,
             types=types,
         )
@@ -1267,16 +1272,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_csv(metrics_csv, metrics)
 
     metadata = {
-        **config.ConfigSnapshot(
+        **config.ConfigSnapshot.from_args(
+            args,
+            # CLI names that do not match a snapshot field:
             store_backend=store_backend,
-            recent_window_turns=args.recent_window_turns,
-            active_chain_token_limit=args.active_chain_token_limit,
-            llm_backend=args.llm_backend or config.LLM_BACKEND,
             model_name=args.model or config.MODEL_NAME,
-            temperature=args.temperature,
-            system_name=",".join(systems),
             judge_backend=args.judge,
-            seed=args.seed,
+            system_name=",".join(systems),
         ).as_dict(),
         "run_id": run_id,
         "dataset": args.dataset or args.dataset_name or ("synthetic" if args.synthetic else ""),
