@@ -25,7 +25,11 @@ name: publish
 
 on:
   push:
-    tags: ["v*"]
+    # Both conventions, and the second pattern is load-bearing: a pattern without a
+    # leading `v` does NOT match `v*`, so a per-package tag such as
+    # `memory3l-mcp-v0.1.1` would push, trigger nothing, and report no error --
+    # a release that silently does not happen.
+    tags: ["v*", "memory3l-*"]
   workflow_dispatch:
     inputs:
       package:
@@ -120,6 +124,10 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-core
+          # The two packages version independently, so a tag usually leaves one of
+          # them unchanged. Without this, its job would fail the whole release on a
+          # duplicate upload instead of skipping the package that did not move.
+          skip-existing: true
 
   publish-memory3l-mcp:
     needs: build
@@ -135,3 +143,4 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true
