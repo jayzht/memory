@@ -37,6 +37,22 @@ is only needed when developing against a source checkout:
 MEMORY3L_ROOT=/path/to/Memory uvx memory3l-mcp
 ```
 
+**Upgrading may need a fresh cache.** `uv` caches the package index, and right after
+a release the cached copy can still say the new version does not exist:
+
+```
+× No solution found when resolving tool dependencies:
+╰─▶ Because there is no version of memory3l-mcp==0.2.0 ...
+```
+
+`--refresh` re-resolves the tool environment but does not invalidate that index
+response. Pin the version (`uvx memory3l-mcp@0.2.0`) with a clean cache, or wait for
+the TTL:
+
+```bash
+UV_CACHE_DIR=$(mktemp -d) uvx memory3l-mcp@0.2.0 --help
+```
+
 The ledger defaults to `~/.memory3l/memory3l.db` and is **created on demand**, so a
 fresh install starts and answers `episodes: []` instead of failing. Point it
 somewhere else with `MEMORY3L_DB`, or `--db PATH`.
