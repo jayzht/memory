@@ -1619,6 +1619,105 @@ class MemoryManager:
             ),
         )
 
+    def erase_facts(self, fact_ids: Sequence[str], reason: str = "erasure") -> Dict[str, Any]:
+        """
+        Compliance erasure: destroy named facts while keeping the audit shape.
+
+        This is the one operation that deliberately overrides "raw is never deleted",
+        so it is explicit, scoped to named fact ids, and **verified afterwards**:
+
+        1. the fact is dropped from live summaries' ``fact_keys`` so it disappears
+           from the derived current-value registry (a value that is still rendered is
+           not erased);
+        2. its raw records are destroyed -- but only those no *surviving* fact still
+           needs;
+        3. the ledger row becomes a tombstone: the value is blanked, the evidence
+           pointer is kept so ``I5_deletion_verifiable`` can prove the data is gone;
+        4. prose that still mentions the value is **reported, not rewritten**: an
+           LLM-written summary is not safely editable, and pretending otherwise would
+           be the dishonest kind of "erasure".
+
+        Returns a report suitable for the erasure record; ``residual_mentions`` is
+        persisted on the tombstone so the residue cannot be silently forgotten.
+        """
+        selected = [
+            r for r in (self.fact_ledger.get(fid) for fid in fact_ids)
+            if r is not None and not r.erased
+        ]
+        report: Dict[str, Any] = {
+            "episode_id": self.episode_id,
+            "reason": reason,
+            "erased": [], "raw_deleted": [], "raw_kept_shared": [],
+            "residual": [], "registry_stripped": 0,
+        }
+        if not selected:
+            return report
+
+        # --- 1) residual exposure, measured *before* the value is blanked ---------- #
+        summaries = list(self.list_archived_summaries()) + list(self.list_active_summaries())
+        entries = self.list_index_entries()
+        residual_by_id: Dict[str, int] = {}
+        for record in selected:
+            mentions = [
+                s.summary_id for s in summaries if record.value and record.value in s.text
+            ] + [
+                e.index_id for e in entries if record.value and record.value in e.title
+            ]
+            residual_by_id[record.fact_id] = len(mentions)
+            if mentions:
+                report["residual"].append(
+                    {"fact_id": record.fact_id, "mentions": mentions}
+                )
+
+        erased_pairs = {(r.slot.lower(), r.value) for r in selected}
+
+        def _is_erased_key(key: str) -> bool:
+            slot, _, value = key.partition("=")
+            return (slot.strip().lower(), value.strip()) in erased_pairs
+
+        # --- 2) strip the fact from live summaries so it stops being rendered ----- #
+        for summary in self.store.list_active_summaries(self.episode_id):
+            keys = list(summary.fact_keys or [])
+            kept = [k for k in keys if not _is_erased_key(k)]
+            if len(kept) != len(keys):
+                summary.fact_keys = kept
+                self.store.add_active_summary(summary, episode_id=self.episode_id)
+                report["registry_stripped"] += 1
+
+        # --- 3) destroy the raw records, but never one a survivor still needs ----- #
+        erased_refs = {ref for r in selected for ref in r.evidence}
+        # Exclude the *selected* facts explicitly rather than relying on their erased
+        # flag: the tombstone step runs later, so keying off the flag made every
+        # erased fact count as its own survivor and nothing was ever deleted.
+        selected_ids = {r.fact_id for r in selected}
+        surviving_refs = {
+            ref for r in self.fact_ledger.entries()
+            if r.fact_id not in selected_ids for ref in r.evidence
+        }
+        report["raw_kept_shared"] = sorted(erased_refs & surviving_refs)
+        for reference_id in sorted(erased_refs - surviving_refs):
+            if self.get_raw_record(reference_id) is None:
+                continue
+            self.store.delete_raw_record(reference_id, episode_id=self.episode_id)
+            report["raw_deleted"].append(reference_id)
+
+        # --- 4) tombstone the ledger rows ---------------------------------------- #
+        report["erased"] = self.fact_ledger.erase(
+            [r.fact_id for r in selected], reason=reason, residual_by_id=residual_by_id
+        )
+        # --- 5) verify the erasure actually took (never assert what we can check) -- #
+        report["raw_still_readable"] = [
+            ref for ref in report["raw_deleted"] if self.get_raw_record(ref) is not None
+        ]
+        logger.info(
+            "erasure for %s: %d fact(s), %d raw record(s) destroyed, "
+            "%d shared record(s) kept, %d prose mention(s) remain",
+            self.episode_id, len(report["erased"]), len(report["raw_deleted"]),
+            len(report["raw_kept_shared"]),
+            sum(r["mentions"].__len__() for r in report["residual"]),
+        )
+        return report
+
     def explain_fact(self, fact_id: str) -> Dict[str, Any]:
         """Why is this fact not in the working set any more, and who replaced it?"""
         record = self.fact_ledger.get(fact_id)

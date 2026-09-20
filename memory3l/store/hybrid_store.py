@@ -139,6 +139,9 @@ class RedisSQLiteHybridStore(BaseMemoryStore):
             summary_id, reason, superseded_by, episode_id=self._ep(episode_id)
         )
 
+    def erase_fact_ledger(self, rows, episode_id=None) -> int:
+        return self.cold.erase_fact_ledger(rows, self._ep(episode_id))
+
     def clear_fact_ledger(self, episode_id) -> int:
         return self.cold.clear_fact_ledger(self._ep(episode_id))
 

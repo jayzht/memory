@@ -855,6 +855,144 @@ class TestExtractionCompleteness(unittest.TestCase):
         self.assertTrue(any(v.startswith("I4:") for v in report.violations), report.violations)
 
 
+class TestComplianceErasure(unittest.TestCase):
+    """
+    Compliance erasure is the one operation that overrides "raw is never deleted", so
+    it must be explicit **and verified**: I5 proves the data is actually gone, rather
+    than trusting a flag.  Prose that still mentions the value is reported, because an
+    LLM-written summary is not safely rewritable and pretending otherwise would be the
+    dishonest kind of erasure.
+    """
+
+    @staticmethod
+    def _run(turns=24):
+        from memory3l.dataset import build_long_context_episodes
+
+        episode = build_long_context_episodes(
+            num_episodes=1, turns_per_episode=turns, seed=777, language="zh"
+        )[0]
+        store = InMemoryStore(recent_window_turns=4)
+        manager = MemoryManager(store, HeuristicLLM(), episode_id="ep_erase",
+                                active_chain_token_limit=400, reset_on_bind=True)
+        for user, reply in episode.dialogues:
+            manager.add_dialog_turn(user, reply)
+        return manager
+
+    def test_erasure_destroys_the_value_and_the_evidence(self):
+        manager = self._run()
+        targets = [r.fact_id for r in manager.fact_ledger.entries() if r.slot == "工位楼层"]
+        self.assertTrue(targets)
+        report = manager.erase_facts(targets, reason="gdpr-art17")
+
+        self.assertEqual(len(report["erased"]), len(targets))
+        self.assertTrue(report["raw_deleted"])
+        self.assertEqual(report["raw_still_readable"], [])
+        for reference_id in report["raw_deleted"]:
+            self.assertIsNone(manager.get_raw_record(reference_id))
+
+        audit = manager.verify()
+        deletion = audit.invariants["I5_deletion_verifiable"]
+        self.assertTrue(deletion["ok"], audit.violations)
+        self.assertEqual(deletion["erased_facts"], len(targets))
+        self.assertEqual(deletion["value_still_present"], 0)
+        self.assertEqual(deletion["evidence_still_resolvable"], 0)
+        # the residual is *reported*, not hidden
+        self.assertGreater(deletion["residual_prose_mentions"], 0)
+        # ...and the value is gone from the rendered top level: a value that is still
+        # shown to the model has not been erased.
+        self.assertNotIn("工位楼层", manager.render_current_values())
+
+    def test_a_tombstone_without_deleting_the_raw_record_fails_i5(self):
+        """The control: flag-only "erasure" must be caught, not believed."""
+        manager = self._run()
+        target = manager.fact_ledger.entries()[0]
+        self.assertIsNotNone(manager.get_raw_record(target.evidence[0]))
+        manager.fact_ledger.erase([target.fact_id], reason="pretend")   # no raw deletion
+
+        audit = manager.verify()
+        deletion = audit.invariants["I5_deletion_verifiable"]
+        self.assertFalse(deletion["ok"])
+        self.assertEqual(deletion["evidence_still_resolvable"], 1)
+        self.assertFalse(audit.ok)
+        self.assertTrue(any(v.startswith("I5:") for v in audit.violations))
+
+    def test_a_shared_raw_record_is_not_destroyed(self):
+        """
+        One raw record can back several facts; erasing one must not orphan the rest.
+        """
+        store = InMemoryStore(recent_window_turns=4)
+        manager = MemoryManager(
+            store, ScriptedLLM(lambda messages: "两点\n[FACTS: 城市=上海; 饮料=咖啡]\n[OVERRIDES: none]"),
+            episode_id="ep_shared", active_chain_token_limit=10 ** 6,
+        )
+        manager.add_dialog_turn("我搬到上海了，而且现在只喝咖啡。", "记住了")
+        facts = {r.slot: r for r in manager.fact_ledger.entries()}
+        self.assertEqual(set(facts), {"城市", "饮料"})
+        self.assertEqual(facts["城市"].evidence, facts["饮料"].evidence)
+
+        report = manager.erase_facts([facts["城市"].fact_id], reason="gdpr")
+        self.assertEqual(report["raw_deleted"], [], "the shared record must survive")
+        self.assertEqual(report["raw_kept_shared"], facts["城市"].evidence)
+        self.assertIsNotNone(manager.get_raw_record(facts["饮料"].evidence[0]))
+        audit = manager.verify()
+        # the surviving fact still resolves, so the erasure broke nothing
+        self.assertTrue(audit.invariants["I3_provenance_resolvable"]["ok"])
+        self.assertTrue(audit.invariants["I5_deletion_verifiable"]["ok"])
+
+
+class TestErasurePersistence(unittest.TestCase):
+    """A tombstone that does not survive a restart is not an erasure record."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "erase.db")
+
+    def _hybrid(self):
+        from memory3l.store.hybrid_store import RedisSQLiteHybridStore
+        from memory3l.store.redis_store import RedisHotStore
+        from memory3l.store.sqlite_store import SQLiteColdStore
+        from test_store import FakeRedis
+
+        return RedisSQLiteHybridStore(
+            redis_store=RedisHotStore(key_prefix="episode:{episode_id}", client=FakeRedis()),
+            sqlite_store=SQLiteColdStore(self.db),
+        )
+
+    def test_tombstone_and_verification_survive_a_restart(self):
+        from memory3l.audit import FactLedger, audit_episode
+        from memory3l.dataset import build_long_context_episodes
+
+        episode = build_long_context_episodes(
+            num_episodes=1, turns_per_episode=16, seed=777, language="zh"
+        )[0]
+        episode_id = "three_layer/long_0000"
+        store = self._hybrid()
+        manager = MemoryManager(store, HeuristicLLM(), episode_id=episode_id,
+                                active_chain_token_limit=400, reset_on_bind=True)
+        for user, reply in episode.dialogues:
+            manager.add_dialog_turn(user, reply)
+        target = manager.fact_ledger.entries()[0]
+        report = manager.erase_facts([target.fact_id], reason="gdpr-art17")
+        self.assertTrue(report["raw_deleted"])
+        del manager, store                       # the writing process is gone
+
+        reopened = self._hybrid()
+        ledger = FactLedger(episode_id, store=reopened)
+        reloaded = ledger.get(target.fact_id)
+        self.assertIsNotNone(reloaded)
+        self.assertTrue(reloaded.erased, "the tombstone did not survive")
+        self.assertEqual(reloaded.value, "", "the value came back from the database")
+        self.assertEqual(reloaded.reason, "gdpr-art17")
+        self.assertEqual(reloaded.residual_mentions, target.residual_mentions)
+        for reference_id in report["raw_deleted"]:
+            self.assertIsNone(reopened.get_raw_record(reference_id, episode_id=episode_id))
+
+        audit = audit_episode(reopened, episode_id)
+        deletion = audit.invariants["I5_deletion_verifiable"]
+        self.assertTrue(deletion["ok"], audit.violations)
+        self.assertEqual(deletion["erased_facts"], 1)
+
+
 class TestLedgerPersistence(unittest.TestCase):
     """
     The ledger must outlive the process that wrote it.
@@ -1006,6 +1144,10 @@ class TestAuditSidecar(unittest.TestCase):
         import urllib.request
 
         from audit_server import build_server
+        from memory3l.store.hybrid_store import RedisSQLiteHybridStore
+        from memory3l.store.redis_store import RedisHotStore
+        from memory3l.store.sqlite_store import SQLiteColdStore
+        from test_store import FakeRedis
 
         episode_id, fact_id = self._seed()
         httpd = build_server("127.0.0.1", 0, self.db, "tok")
@@ -1032,6 +1174,30 @@ class TestAuditSidecar(unittest.TestCase):
             self.assertEqual(get(f"/audit?episode={episode_id}", token=None)[0], 403)
             self.assertEqual(get("/fact?fact_id=nope")[0], 404)
             self.assertEqual(get("/fact")[0], 400)
+
+            # ...and the erasure surface: an auditor asks what is provably gone
+            manager = MemoryManager(
+                RedisSQLiteHybridStore(
+                    redis_store=RedisHotStore(key_prefix="episode:{episode_id}", client=FakeRedis()),
+                    sqlite_store=SQLiteColdStore(self.db),
+                ),
+                HeuristicLLM(), episode_id=episode_id,
+                active_chain_token_limit=400, reset_on_bind=True,
+            )
+            from memory3l.dataset import build_long_context_episodes as _build
+
+            for user, reply in _build(
+                num_episodes=1, turns_per_episode=8, seed=777, language="zh"
+            )[0].dialogues:
+                manager.add_dialog_turn(user, reply)
+            victim = manager.fact_ledger.entries()[0]
+            manager.erase_facts([victim.fact_id], reason="gdpr")
+            status, payload = get(f"/tombstones?episode={urllib.parse.quote(episode_id, safe='')}")
+            self.assertEqual(status, 200)
+            self.assertEqual(len(payload["tombstones"]), 1)
+            self.assertEqual(payload["tombstones"][0]["reason"], "gdpr")
+            self.assertEqual(payload["tombstones"][0]["value"], "")
+            self.assertEqual(payload["tombstones"][0]["evidence_still_readable"], [])
         finally:
             httpd.shutdown()
             httpd.server_close()          # release the listening socket

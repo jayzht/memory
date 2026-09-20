@@ -21,6 +21,9 @@ Two things are reported:
      dropped ``fact_keys``/``index_id`` (this is the defect that made every real
      hybrid run's index digests empty).  I2 must fire, because the derived
      current-value registry can no longer see any value.
+   * *Control D -- an erasure that only flips a flag*: tombstone a fact without
+     destroying its raw record.  I5 must fail -- an erasure has to be verified, not
+     believed.
    * *Control C -- a dead extractor*: make the summariser extract nothing at all.
      I1-I3 must keep passing (there is nothing to lose) and only I4 may notice --
      this is the blind spot I4 exists for, and the shape of the M1 finding where
@@ -198,6 +201,19 @@ def main() -> int:
     if not fired_c:
         failures.append("control C did not show the storage invariants' blind spot")
 
+    # Control D -- a flag-only "erasure" must fail I5
+    manager_d = run_episode(episodes[0])
+    target = manager_d.fact_ledger.entries()[0]
+    manager_d.fact_ledger.erase([target.fact_id], reason="pretend")   # no raw deletion
+    report_d = manager_d.verify()
+    deletion = report_d.invariants["I5_deletion_verifiable"]
+    fired_d = not deletion["ok"]
+    print(f"  [{'PASS' if fired_d else 'FAIL'}] 对照 D（只打墓碑、不删原文）")
+    print(f"         期望 I5 失败 -> {'I5 失败' if fired_d else 'I5 仍然通过！'}")
+    print(f"         evidence_still_resolvable = {deletion['evidence_still_resolvable']}")
+    if not fired_d:
+        failures.append("control D did not trip I5")
+
     # ---------------------------------------------------------------- #
     print()
     if failures:
@@ -205,7 +221,7 @@ def main() -> int:
             print(f"!! 对照未按预期失败: {item}")
         print("→ 审计面不可信，必须先修检查本身。")
         return 1
-    print("结论: 审计面通过，且三个对照都按预期失败 —— 这些检查是有判别力的。")
+    print("结论: 审计面通过，且四个对照都按预期失败 —— 这些检查是有判别力的。")
     return 0
 
 

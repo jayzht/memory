@@ -115,7 +115,9 @@ CREATE TABLE IF NOT EXISTS fact_ledger (
     observed_turn INTEGER NOT NULL DEFAULT -1,
     evidence      TEXT NOT NULL DEFAULT '',
     reason        TEXT NOT NULL DEFAULT '',
-    superseded_by TEXT NOT NULL DEFAULT ''
+    superseded_by TEXT NOT NULL DEFAULT '',
+    residual_mentions INTEGER NOT NULL DEFAULT 0,
+    erased        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_episode ON fact_ledger(episode_id, seq);
 
@@ -198,6 +200,8 @@ class SQLiteColdStore:
             # round-trip.  Losing ``previews`` made every index line render the
             # full member summaries instead of a ~10-token snippet; losing
             # ``child_index_ids`` broke super-index bookkeeping.
+            "fact_ledger": {"residual_mentions": "INTEGER NOT NULL DEFAULT 0",
+                            "erased": "INTEGER NOT NULL DEFAULT 0"},
             "index_entries": {"previews": "TEXT NOT NULL DEFAULT ''",
                               "child_index_ids": "TEXT NOT NULL DEFAULT ''",
                               "theme": "TEXT NOT NULL DEFAULT ''"},
@@ -309,7 +313,9 @@ class SQLiteColdStore:
             row = self.query_one("SELECT COUNT(*) AS n FROM raw_records WHERE episode_id=?", (episode_id,))
         return int(row["n"]) if row else 0
 
-    def delete_raw_record(self, reference_id: str) -> None:
+    def delete_raw_record(
+        self, reference_id: str, episode_id: Optional[str] = None
+    ) -> None:
         """
         Hard-delete one raw record.
 
@@ -611,8 +617,9 @@ class SQLiteColdStore:
             cursor = self._conn.executemany(
                 """INSERT OR IGNORE INTO fact_ledger
                        (fact_id, episode_id, summary_id, slot, value, seq,
-                        observed_turn, evidence, reason, superseded_by)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        observed_turn, evidence, reason, superseded_by,
+                        residual_mentions, erased)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 [
                     (
                         row.get("fact_id", ""), row.get("episode_id", ""),
@@ -623,6 +630,8 @@ class SQLiteColdStore:
                         _as_int(row.get("seq"), -1), _as_int(row.get("observed_turn"), -1),
                         row.get("evidence", ""), row.get("reason", ""),
                         row.get("superseded_by", ""),
+                        _as_int(row.get("residual_mentions"), 0),
+                        _as_int(row.get("erased"), 0),
                     )
                     for row in rows
                 ],
@@ -657,6 +666,27 @@ class SQLiteColdStore:
                 (reason, superseded_by, summary_id, episode_id),
             )
         return int(cursor.rowcount or 0)
+
+    def erase_fact_ledger(self, rows: Sequence[Dict[str, Any]], episode_id: Optional[str] = None) -> int:
+        """Tombstone rows: blank the value, keep the evidence pointer for I5."""
+        if not rows:
+            return 0
+        with self._lock:
+            cursor = self._conn.executemany(
+                """UPDATE fact_ledger
+                      SET erased=1, reason=?, value='', residual_mentions=?
+                    WHERE fact_id=?""",
+                [
+                    (
+                        row.get("reason", "erased"),
+                        _as_int(row.get("residual_mentions"), 0),
+                        row.get("fact_id", ""),
+                    )
+                    for row in rows
+                ],
+            )
+            self._conn.commit()
+            return int(cursor.rowcount or 0)
 
     def clear_fact_ledger(self, episode_id: str) -> int:
         cursor = self.execute("DELETE FROM fact_ledger WHERE episode_id=?", (episode_id,))

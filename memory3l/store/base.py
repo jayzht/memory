@@ -301,6 +301,31 @@ class BaseMemoryStore(abc.ABC):
                 touched += 1
         return touched
 
+    def erase_fact_ledger(self, rows: Sequence[Dict[str, Any]], episode_id: Optional[str] = None) -> int:
+        """
+        Tombstone ledger rows: keep the shape, destroy the content.
+
+        ``value`` is blanked (the fact must no longer be readable) while ``evidence``
+        is **kept**, so the audit can verify that the raw records it pointed at are
+        now unreachable.  ``reason`` records why, and ``residual_mentions`` how much
+        prose still refers to the value.
+        """
+        table = getattr(self, "_ledger_rows", None) or {}
+        touched = 0
+        for row in rows:
+            fact_id = row.get("fact_id", "")
+            for (episode, fid), stored in table.items():
+                if fid != fact_id:
+                    continue
+                if episode_id is not None and episode != self._ep(episode_id):
+                    continue
+                stored["reason"] = row.get("reason", "erased")
+                stored["value"] = ""
+                stored["erased"] = 1
+                stored["residual_mentions"] = int(row.get("residual_mentions", 0) or 0)
+                touched += 1
+        return touched
+
     def clear_fact_ledger(self, episode_id: str) -> int:
         table = getattr(self, "_ledger_rows", None)
         if not table:

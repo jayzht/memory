@@ -17,6 +17,7 @@ Endpoints (all GET, all require ``?token=``):
     GET /current?episode=<id>                     the top-level current values
     GET /fact?fact_id=<id>                        why a fact left the working set
     GET /fact/evidence?fact_id=<id>               the original dialogue it came from
+    GET /tombstones?episode=<id>                  compliance erasures (what is gone)
 
 **Use the query-parameter form.** A ``fact_id`` is
 ``<episode>/<kind><seq>@<hash>#<slot>`` and contains ``#``, which in a URL starts
@@ -82,6 +83,35 @@ class AuditService:
                 for slot, value, summary_id in values
             ],
         }
+
+    def tombstones(self, episode_id: str):
+        """
+        What was erased, and what is provably gone.
+
+        An auditor asks two questions, and they are opposites: "nothing was lost"
+        (I1) and "what was meant to be deleted really is" (I5).  This answers the
+        second one, listing tombstones plus the prose that still mentions them.
+        """
+        ledger = FactLedger(episode_id, store=self.store)
+        rows = []
+        for record in ledger.entries():
+            if not record.erased:
+                continue
+            resolvable = [
+                ref for ref in record.evidence
+                if self.store.get_raw_record(ref, episode_id=episode_id) is not None
+            ]
+            rows.append({
+                "fact_id": record.fact_id,
+                "slot": record.slot,
+                "observed_turn": record.observed_turn,
+                "reason": record.reason,
+                "value": record.value,               # empty once erased
+                "evidence_pointers": list(record.evidence),
+                "evidence_still_readable": resolvable,
+                "residual_prose_mentions": record.residual_mentions,
+            })
+        return {"episode_id": episode_id, "tombstones": rows}
 
     def fact(self, fact_id: str):
         ledger = self._ledger_for(fact_id)
@@ -198,6 +228,13 @@ def make_handler(service: AuditService, token: str):
                 payload = (service.evidence if path.endswith("/evidence") else service.fact)(fact_id)
                 self._send(payload if payload is not None else {"error": "unknown fact_id"},
                            200 if payload is not None else 404)
+                return
+            if path == "/tombstones":
+                episode_id = (query.get("episode") or [""])[0]
+                if not episode_id:
+                    self._send({"error": "missing ?episode=<id>"}, 400)
+                    return
+                self._send(service.tombstones(episode_id))
                 return
             if path.startswith("/fact/"):
                 rest = path[len("/fact/"):]

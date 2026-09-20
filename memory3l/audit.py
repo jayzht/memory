@@ -66,6 +66,17 @@ class FactRecord:
     superseded_by: str = ""
     #: filled in by verify(): still present in the store (active or archived)
     resolved: bool = False
+    #: True once a compliance erasure destroyed this fact's content.  A real flag,
+    #: not a magic ``reason`` string: "why it left the working set" (overridden /
+    #: capacity) and "the content was destroyed" are orthogonal properties, and
+    #: conflating them made an erasure with a legal basis ("gdpr-art17") invisible to
+    #: the verification invariant.
+    erased: bool = False
+    #: How many places still contain this value *in prose* after a compliance
+    #: erasure.  We blank the value and destroy the raw evidence, but an LLM-written
+    #: summary is not safely rewritable, so the residue is reported rather than
+    #: silently left behind.
+    residual_mentions: int = 0
 
     def render(self) -> str:
         state = "live" if not self.reason else self.reason
@@ -86,6 +97,8 @@ class FactRecord:
             "evidence": "|".join(self.evidence),
             "reason": self.reason,
             "superseded_by": self.superseded_by,
+            "residual_mentions": int(self.residual_mentions),
+            "erased": 1 if self.erased else 0,
         }
 
     @classmethod
@@ -114,6 +127,8 @@ class FactRecord:
             evidence=[ref for ref in str(evidence).split("|") if ref],
             reason=row.get("reason", "") or "",
             superseded_by=row.get("superseded_by", "") or "",
+            residual_mentions=_int(row.get("residual_mentions"), 0),
+            erased=bool(_int(row.get("erased"), 0)),
         )
 
 
@@ -260,6 +275,36 @@ class FactLedger:
                 pass
         return touched
 
+    def erase(
+        self, fact_ids: Sequence[str], reason: str = "erased",
+        residual_by_id: Optional[Dict[str, int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Tombstone facts: destroy the value, keep the shape and the evidence pointer.
+
+        Keeping ``evidence`` is what makes the erasure *verifiable*: I5 can then check
+        that the raw records it named are now unreachable, instead of trusting a flag.
+        """
+        rows: List[Dict[str, Any]] = []
+        for fact_id in fact_ids:
+            record = self._by_id.get(fact_id)
+            if record is None or record.erased:
+                continue
+            record.erased = True
+            record.reason = reason          # keeps the legal basis alongside the flag
+            record.value = ""
+            record.residual_mentions = int((residual_by_id or {}).get(fact_id, 0))
+            rows.append({
+                "fact_id": fact_id, "reason": reason,
+                "residual_mentions": record.residual_mentions,
+            })
+        if rows and self.store is not None:
+            try:
+                self.store.erase_fact_ledger(rows, self.episode_id)
+            except (AttributeError, NotImplementedError):
+                pass
+        return rows
+
     # ------------------------------------------------------------------ #
     # reading
     # ------------------------------------------------------------------ #
@@ -276,6 +321,8 @@ class FactLedger:
         """Newest observation per slot -- the ledger's view of "what is true now"."""
         current: Dict[str, FactRecord] = {}
         for record in self._records:               # appended in creation order
+            if record.erased:
+                continue                           # the value was destroyed on purpose
             current[record.slot] = record
         return current
 
@@ -511,7 +558,12 @@ def verify_invariants(
     # --- I3 provenance resolvability -------------------------------------- #
     unresolved: List[str] = []
     without_evidence = 0
+    erased_entries = [r for r in entries if r.erased]
     for record in entries:
+        if record.erased:
+            # A compliance erasure deliberately destroys the evidence, so the
+            # provenance invariant does not apply; I5 checks the opposite property.
+            continue
         if not record.evidence:
             without_evidence += 1
             continue
@@ -519,9 +571,44 @@ def verify_invariants(
             unresolved.append(record.fact_id)
     provenance = {
         "ok": not unresolved and without_evidence == 0,
-        "checked": len(entries),
+        # Counts only what was actually checked: erased facts are exempt (I5 covers
+        # them), and reporting them as "checked" would overstate the coverage.
+        "checked": len(entries) - len(erased_entries),
+        "erased_exempt": len(erased_entries),
         "unresolved_evidence": len(unresolved),
         "missing_evidence": without_evidence,
+    }
+
+    # --- I5 deletion verifiability ---------------------------------------- #
+    # The mirror image of I1: I1 proves nothing was lost, I5 proves what was
+    # *supposed* to be deleted is actually gone.  An erasure that only flips a flag
+    # leaves the value readable and must be reported as a violation.
+    still_present_value = [r.fact_id for r in erased_entries if r.value]
+    # One raw record can back several facts.  If a *surviving* fact still needs it,
+    # the record must be kept -- so "the evidence still resolves" is only a violation
+    # when nothing else depends on it.  Without this distinction the invariant would
+    # force us to destroy data that is still in use.
+    surviving_refs = {
+        ref for r in entries if not r.erased for ref in r.evidence
+    }
+    still_resolvable: List[str] = []
+    kept_shared = 0
+    for record in erased_entries:
+        for ref in record.evidence:
+            if ref in surviving_refs:
+                kept_shared += 1
+                continue
+            if raw_lookup(ref) is not None:
+                still_resolvable.append(record.fact_id)
+                break
+    residual_total = sum(r.residual_mentions for r in erased_entries)
+    deletion = {
+        "ok": not still_present_value and not still_resolvable,
+        "erased_facts": len(erased_entries),
+        "value_still_present": len(still_present_value),
+        "evidence_still_resolvable": len(still_resolvable),
+        "evidence_kept_shared": kept_shared,
+        "residual_prose_mentions": residual_total,
     }
 
     # --- I2 top-level current-value reachability -------------------------- #
@@ -558,6 +645,7 @@ def verify_invariants(
     }
     if extraction is not None:
         invariants["I4_extraction_completeness"] = extraction
+    invariants["I5_deletion_verifiable"] = deletion
     violations: List[str] = []
     if missing:
         violations.append(
@@ -573,6 +661,11 @@ def verify_invariants(
         violations.append(
             f"I3: {len(unresolved)} unresolved evidence pointer(s), "
             f"{without_evidence} fact(s) with no evidence at all"
+        )
+    if not deletion["ok"]:
+        violations.append(
+            f"I5: an erasure did not take effect -- {len(still_present_value)} fact(s) "
+            f"still hold a value, {len(still_resolvable)} still resolve to raw evidence"
         )
     if extraction is not None and not extraction["ok"]:
         violations.append(
