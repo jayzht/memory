@@ -32,7 +32,12 @@ redis = ["redis>=5.0"]
 openai = ["openai>=1.0"]
 tiktoken = ["tiktoken>=0.5"]
 datasets = ["datasets>=2.18"]
-all = ["redis>=5.0", "openai>=1.0", "tiktoken>=0.5", "datasets>=2.18"]
+# Streaming parser for the real LongMemEval file. Without it the loader falls back
+# to json.load with a warning -- correct, just memory-hungry. It was previously
+# undeclared and only found on sys.path via a stray ./.pylibs, which made the test
+# suite pass on one machine and fail on a clean checkout.
+longmemeval = ["ijson>=3.2"]
+all = ["redis>=5.0", "openai>=1.0", "tiktoken>=0.5", "datasets>=2.18", "ijson>=3.2"]
 
 [tool.hatch.version]
 path = "memory3l/__init__.py"

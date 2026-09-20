@@ -69,14 +69,31 @@ DEFAULT_PATH = os.path.join(
 
 
 def _iter_raw(path: str, limit: Optional[int]) -> Iterator[Dict[str, Any]]:
-    """Stream the cleaned JSON array without loading it whole."""
+    """
+    Stream a cleaned JSON array, one record at a time.
+
+    ``ijson`` is used when present because the real LongMemEval file is large enough
+    that loading it whole is a problem. It is *not* required for correctness, so its
+    absence falls back to the stdlib parser with a warning instead of raising: a
+    refusal to run made a test fixture fail on any machine without an undeclared
+    optional dependency, which is exactly how the release pipeline broke while every
+    local run passed (this checkout had a stray `.pylibs/ijson` on `sys.path`).
+    """
     try:
         import ijson  # type: ignore
-    except ImportError as exc:  # pragma: no cover - dependency hint
-        raise RuntimeError(
-            "LongMemEval needs the `ijson` streaming parser: "
-            "pip install --target ./.pylibs ijson"
-        ) from exc
+    except ImportError:
+        logger.warning(
+            "ijson is not installed; falling back to json.load, which reads the whole "
+            "file into memory. Fine for fixtures and small slices, not for the full "
+            "LongMemEval set -- `pip install ijson` (or `pip install memory3l[longmemeval]`) "
+            "restores streaming."
+        )
+        with open(path, "r", encoding="utf-8") as fallback:
+            for index, record in enumerate(json.load(fallback)):
+                if limit is not None and index >= limit:
+                    break
+                yield record
+        return
     with open(path, "rb") as handle:
         for index, record in enumerate(ijson.items(handle, "item")):
             if limit is not None and index >= limit:
