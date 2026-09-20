@@ -346,6 +346,13 @@ class InMemoryStore(BaseMemoryStore):
     def add_raw_record(self, record: RawDialogRecord, episode_id: Optional[str] = None) -> None:
         episode = record.episode_id or self._ep(episode_id)
         record.episode_id = episode
+        # Idempotent like the SQLite backend (which upserts on the primary key).
+        # Without the guard, re-adding a deterministic id appended a second entry to
+        # the episode list, so count_raw_records/list_raw_records -- and therefore
+        # full_context's token totals -- double-counted on the default backend.
+        if record.reference_id in self._raw:
+            self._raw[record.reference_id] = record
+            return
         self._raw[record.reference_id] = record
         self._raw_by_episode.setdefault(episode, []).append(record.reference_id)
 

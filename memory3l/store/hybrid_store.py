@@ -266,12 +266,10 @@ class RedisSQLiteHybridStore(BaseMemoryStore):
         return self.cold.list_active_summaries(episode)
 
     def count_active_summaries(self, episode_id: Optional[str] = None) -> int:
-        if self.hot.available:
-            try:
-                return int(self.hot._call("llen", self.hot.key("active_ids", episode_id or self._bound_episode)))
-            except RedisUnavailable:
-                pass
-        return len(self.cold.list_active_summaries(self._ep(episode_id)))
+        # Count through the *same* path the reads use.  LLEN counts raw list entries
+        # (including any legacy duplicates the list path dedupes) and returns 0 on a
+        # hot miss where the list path falls back to SQLite, so the two disagreed.
+        return len(self.list_active_summaries(episode_id))
 
     # ------------------------------------------------------------------ #
     # Layer 1 upper level: index entries (Redis hot, SQLite durable)
@@ -359,18 +357,19 @@ class RedisSQLiteHybridStore(BaseMemoryStore):
     def append_window_record(self, record: RawDialogRecord, episode_id: Optional[str] = None) -> List[RawDialogRecord]:
         episode = record.episode_id or self._ep(episode_id)
         record.episode_id = episode
-        if self.hot.available:
-            try:
-                window = self.hot.append_window(record, self.recent_window_turns, episode_id=episode)
-                self.cold.set_window(episode, window)   # mirror for crash recovery
-                return window
-            except RedisUnavailable as exc:
-                self._degrade(f"append_window_record: {exc}")
-        self._fallback()
+        # Cold first, like every other write in this class.  This used to update
+        # Redis and mirror afterwards, which broke the "SQLite is the source of
+        # truth, Redis is a cache" ordering: a crash in between left the mirror
+        # stale, and rebuild_hot_state restores the window only from that mirror.
         window = self.cold.get_window(episode)
         window.append(record)
         window = window[-self.recent_window_turns :]
         self.cold.set_window(episode, window)
+        if self.hot.available:
+            try:
+                self.hot.set_window(window, episode_id=episode)
+            except RedisUnavailable as exc:
+                self._degrade(f"append_window_record: {exc}")
         return window
 
     def get_window(self, episode_id: Optional[str] = None) -> List[RawDialogRecord]:

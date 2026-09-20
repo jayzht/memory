@@ -160,6 +160,37 @@ class RedisHotStore:
         except Exception as exc:  # noqa: BLE001
             raise RedisUnavailable(f"Redis {method} failed: {exc}") from exc
 
+    def _pipeline(self):
+        """
+        A guarded pipeline whose ``execute()`` raises :class:`RedisUnavailable`.
+
+        Only :meth:`_call` used to be wrapped, so a connection error inside any of
+        the pipeline-based writes escaped the hybrid store's
+        ``except RedisUnavailable`` and aborted the episode -- even though SQLite had
+        already committed the same write.  That directly contradicted the
+        "Redis dies mid-run, the experiment degrades" contract.
+        """
+        if self._client is None:
+            raise RedisUnavailable("Redis client is not available")
+
+        class _GuardedPipeline:
+            def __init__(self, pipe):
+                self._pipe = pipe
+
+            def __getattr__(self, name):
+                return getattr(self._pipe, name)
+
+            def execute(self):
+                try:
+                    return self._pipe.execute()
+                except Exception as exc:  # noqa: BLE001
+                    raise RedisUnavailable(f"Redis pipeline failed: {exc}") from exc
+
+        try:
+            return _GuardedPipeline(self._client.pipeline(transaction=True))
+        except Exception as exc:  # noqa: BLE001
+            raise RedisUnavailable(f"Redis pipeline creation failed: {exc}") from exc
+
     # ------------------------------------------------------------------ #
     # active chain
     # ------------------------------------------------------------------ #
@@ -168,7 +199,7 @@ class RedisHotStore:
         ep = episode_id or self._bound_episode
         ids_key = self.key(_ACTIVE_IDS_KEY, ep)
         hash_key = self.key(_ACTIVE_HASH_KEY, ep)
-        pipe = self._client.pipeline(transaction=True)
+        pipe = self._pipeline()
         pipe.delete(ids_key, hash_key)
         if summaries:
             pipe.rpush(ids_key, *[s.summary_id for s in summaries])
@@ -187,7 +218,7 @@ class RedisHotStore:
         """
         ep = episode_id or self._bound_episode
         ids_key = self.key(_ACTIVE_IDS_KEY, ep)
-        pipe = self._client.pipeline(transaction=True)
+        pipe = self._pipeline()
         pipe.lrem(ids_key, 0, summary.summary_id)
         pipe.rpush(ids_key, summary.summary_id)
         pipe.hset(self.key(_ACTIVE_HASH_KEY, ep), summary.summary_id, _dumps_summary(summary))
@@ -202,7 +233,7 @@ class RedisHotStore:
     def remove_active_summary(self, summary_id: str, episode_id: Optional[str] = None) -> Optional[ActiveSummary]:
         summary = self.get_active_summary(summary_id, episode_id)
         ep = episode_id or self._bound_episode
-        pipe = self._client.pipeline(transaction=True)
+        pipe = self._pipeline()
         pipe.lrem(self.key(_ACTIVE_IDS_KEY, ep), 0, summary_id)
         pipe.hdel(self.key(_ACTIVE_HASH_KEY, ep), summary_id)
         pipe.execute()
@@ -243,7 +274,7 @@ class RedisHotStore:
         ep = episode_id or self._bound_episode
         ids_key = self.key(_INDEX_IDS_KEY, ep)
         hash_key = self.key(_INDEX_HASH_KEY, ep)
-        pipe = self._client.pipeline(transaction=True)
+        pipe = self._pipeline()
         pipe.delete(ids_key, hash_key)
         if entries:
             pipe.rpush(ids_key, *[e.index_id for e in entries])
@@ -252,7 +283,7 @@ class RedisHotStore:
 
     def add_index_entry(self, entry: IndexEntry, episode_id: Optional[str] = None) -> None:
         ep = episode_id or self._bound_episode
-        pipe = self._client.pipeline(transaction=True)
+        pipe = self._pipeline()
         pipe.rpush(self.key(_INDEX_IDS_KEY, ep), entry.index_id)
         pipe.hset(self.key(_INDEX_HASH_KEY, ep), entry.index_id, dumps_index(entry))
         pipe.execute()
@@ -276,7 +307,7 @@ class RedisHotStore:
 
     def remove_index_entry(self, index_id: str, episode_id: Optional[str] = None) -> None:
         ep = episode_id or self._bound_episode
-        pipe = self._client.pipeline(transaction=True)
+        pipe = self._pipeline()
         pipe.lrem(self.key(_INDEX_IDS_KEY, ep), 0, index_id)
         pipe.hdel(self.key(_INDEX_HASH_KEY, ep), index_id)
         pipe.execute()
@@ -287,7 +318,7 @@ class RedisHotStore:
     def set_window(self, records: Sequence[RawDialogRecord], episode_id: Optional[str] = None) -> None:
         ep = episode_id or self._bound_episode
         key = self.key(_WINDOW_KEY, ep)
-        pipe = self._client.pipeline(transaction=True)
+        pipe = self._pipeline()
         pipe.delete(key)
         if records:
             pipe.rpush(key, *[dumps_record(r) for r in records])
@@ -296,7 +327,7 @@ class RedisHotStore:
     def append_window(self, record: RawDialogRecord, keep: int, episode_id: Optional[str] = None) -> List[RawDialogRecord]:
         ep = episode_id or self._bound_episode
         key = self.key(_WINDOW_KEY, ep)
-        pipe = self._client.pipeline(transaction=True)
+        pipe = self._pipeline()
         pipe.rpush(key, dumps_record(record))
         pipe.ltrim(key, -keep, -1)
         pipe.lrange(key, 0, -1)

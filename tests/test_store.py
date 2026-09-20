@@ -298,6 +298,90 @@ class TestHotStateRoundTrip(unittest.TestCase):
                 )
 
 
+class TestHotFailuresDegrade(unittest.TestCase):
+    """
+    A Redis failure mid-write must degrade, not abort the episode.
+
+    Only ``_call`` used to be wrapped, so a connection error inside the
+    pipeline-based writes escaped the hybrid store's ``except RedisUnavailable`` --
+    and since SQLite had already committed the same write, the episode died for no
+    reason.  That is the difference between "Redis is a cache" and "Redis is a
+    dependency".
+    """
+
+    class _FailingPipeline:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+        def execute(self):
+            raise ConnectionError("redis went away")
+
+    class _FailingRedis(FakeRedis):
+        def pipeline(self, transaction=True):
+            return TestHotFailuresDegrade._FailingPipeline()
+
+    def test_pipeline_failure_is_contained(self):
+        fake = self._FailingRedis()
+        hot = RedisHotStore(key_prefix="episode:{episode_id}", client=fake)
+        store = RedisSQLiteHybridStore(
+            redis_store=hot, sqlite_store=SQLiteColdStore(":memory:")
+        )
+        store.bind_episode("ep_A", reset=True)
+        summary = ActiveSummary(
+            summary_id="ep_A/s001@aaaaaa", text="t", episode_id="ep_A", seq=1
+        )
+        store.add_active_summary(summary, episode_id="ep_A")  # must not raise
+        self.assertFalse(store.diagnostics["redis_available"])
+        self.assertGreaterEqual(store.diagnostics["redis_degraded_events"], 1)
+        # SQLite is the source of truth, so the write is not lost.
+        self.assertEqual(len(store.cold.list_active_summaries("ep_A")), 1)
+
+
+class TestInMemoryIdempotence(unittest.TestCase):
+    def test_raw_add_is_idempotent(self):
+        """
+        Re-adding a deterministic raw id must not double-count.
+
+        SQLite upserts on the primary key; the in-memory backend appended blindly,
+        so ``count_raw_records`` (and full_context's token totals, which walk the
+        same list) inflated on the default backend.
+        """
+        from memory3l.store import InMemoryStore
+
+        store = InMemoryStore(recent_window_turns=2)
+        store.bind_episode("ep_A", reset=True)
+        record = RawDialogRecord(
+            reference_id="ep_A/raw000@aaaaaa", user_msg="u", agent_msg="a",
+            episode_id="ep_A", turn_index=0,
+        )
+        store.add_raw_record(record, episode_id="ep_A")
+        store.add_raw_record(record, episode_id="ep_A")
+        self.assertEqual(store.count_raw_records("ep_A"), 1)
+        self.assertEqual(len(store.list_raw_records("ep_A")), 1)
+
+
+class TestHybridWindowMirror(unittest.TestCase):
+    def test_window_is_mirrored_before_the_hot_write(self):
+        """
+        The window write must reach SQLite unconditionally.
+
+        It used to update Redis first and mirror afterwards, so a Redis failure (or a
+        crash in between) left the crash-recovery mirror stale -- and
+        ``rebuild_hot_state`` restores the window only from that mirror.
+        """
+        store, fake, cold = make_hybrid()
+        store.bind_episode("ep_A", reset=True)
+        record = RawDialogRecord(
+            reference_id="ep_A/raw000@aaaaaa", user_msg="u", agent_msg="a",
+            episode_id="ep_A", turn_index=0,
+        )
+        store.add_raw_record(record, episode_id="ep_A")
+        store.append_window_record(record, episode_id="ep_A")
+        self.assertEqual(len(cold.get_window("ep_A")), 1)
+        fake.store.clear()  # lose the hot layer
+        self.assertEqual(len(store.get_window("ep_A")), 1, "the mirror must serve the window")
+
+
 class TestSQLitePersistence(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
