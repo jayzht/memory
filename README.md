@@ -173,7 +173,7 @@ episode:{episode_id}:window       LIST  JSON(RawDialogRecord)
 episode:{episode_id}:meta         HASH  轮次等簿记
 ```
 
-**SQLite 六张表**（自动建表）：
+**SQLite 七张表**（自动建表；`evaluation.py` 另建一张 `episode_events`）：
 
 | 表 | 内容 |
 |---|---|
