@@ -172,6 +172,11 @@ INDEX_MAX_PER_TURN: int = _env_int("INDEX_MAX_PER_TURN", 2)
 # leaves the sliding window), so this defaults to off until swept.
 SUMMARY_GATE: str = _env_str("SUMMARY_GATE", "off").lower()
 
+# Minimum acceptable extraction recall (I4) before the audit reports a violation.
+# 0 disables the check: a lexical candidate detector over-generates, so recall below
+# 1.0 is normal and the figure is informational unless a deployment sets its floor.
+EXTRACTION_MIN_RECALL: float = _env_float("EXTRACTION_MIN_RECALL", 0.0)
+
 CURRENT_VALUES_ENABLED: bool = _env_bool("CURRENT_VALUES_ENABLED", True)
 # Hard cap on registry entries.  Recency wins when an episode has many slots.
 CURRENT_VALUES_MAX_SLOTS: int = _env_int("CURRENT_VALUES_MAX_SLOTS", 12)

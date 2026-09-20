@@ -1581,7 +1581,11 @@ class MemoryManager:
     # ------------------------------------------------------------------ #
     # audit surface (see memory3l/audit.py)
     # ------------------------------------------------------------------ #
-    def verify(self, gold_facts: Optional[Sequence[tuple]] = None) -> AuditReport:
+    def verify(
+        self,
+        gold_facts: Optional[Sequence[tuple]] = None,
+        extraction_min_recall: Optional[float] = None,
+    ) -> AuditReport:
         """
         Cross-check the fact ledger against the store and report violations.
 
@@ -1606,6 +1610,13 @@ class MemoryManager:
             raw_lookup=self.get_raw_record,
             reason_counts=reasons,
             gold_facts=gold_facts,
+            # I4 needs the original turns: it compares what was *said* against what the
+            # memory recorded, which is the only way to see a never-extracted fact.
+            raw_records=self.store.list_raw_records(self.episode_id),
+            extraction_min_recall=(
+                getattr(config, "EXTRACTION_MIN_RECALL", 0.0)
+                if extraction_min_recall is None else extraction_min_recall
+            ),
         )
 
     def explain_fact(self, fact_id: str) -> Dict[str, Any]:

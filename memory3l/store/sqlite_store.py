@@ -30,6 +30,16 @@ from ..models import ActiveSummary, ArchivedSummary, RawDialogRecord, pack_refs,
 
 logger = logging.getLogger(__name__)
 
+def _as_int(value, default: int) -> int:
+    """Int conversion that keeps a legitimate ``0`` (``value or default`` would not)."""
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS raw_records (
     reference_id TEXT PRIMARY KEY,
@@ -607,7 +617,10 @@ class SQLiteColdStore:
                     (
                         row.get("fact_id", ""), row.get("episode_id", ""),
                         row.get("summary_id", ""), row.get("slot", ""), row.get("value", ""),
-                        int(row.get("seq", -1) or -1), int(row.get("observed_turn", -1) or -1),
+                        # NOT `int(v or -1)`: that maps a legitimate 0 to -1, which
+                        # silently rewrote every fact recorded on turn 0 (the first
+                        # turn of every episode) as turn -1 on disk only.
+                        _as_int(row.get("seq"), -1), _as_int(row.get("observed_turn"), -1),
                         row.get("evidence", ""), row.get("reason", ""),
                         row.get("superseded_by", ""),
                     )

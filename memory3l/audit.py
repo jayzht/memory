@@ -41,7 +41,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
-__all__ = ["FactRecord", "FactLedger", "AuditReport", "verify_invariants"]
+from .gate import CHANGE, classify, extract_candidate_pairs
+
+__all__ = ["FactRecord", "FactLedger", "AuditReport", "verify_invariants",
+           "extraction_report", "normalise_fact"]
 
 
 @dataclass
@@ -88,14 +91,26 @@ class FactRecord:
     @classmethod
     def from_row(cls, row: Dict[str, Any]) -> "FactRecord":
         evidence = row.get("evidence") or ""
+
+        def _int(value, default: int) -> int:
+            # NOT ``int(value or default)``: turn 0 is a legitimate value, and
+            # collapsing it to -1 silently moved every first-turn fact to a
+            # nonexistent turn on the way back out of the database.
+            if value is None or value == "":
+                return default
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
         return cls(
             fact_id=row["fact_id"],
             summary_id=row.get("summary_id", ""),
             episode_id=row.get("episode_id", ""),
             slot=row.get("slot", ""),
             value=row.get("value", ""),
-            seq=int(row.get("seq", -1) or -1),
-            observed_turn=int(row.get("observed_turn", -1) or -1),
+            seq=_int(row.get("seq"), -1),
+            observed_turn=_int(row.get("observed_turn"), -1),
             evidence=[ref for ref in str(evidence).split("|") if ref],
             reason=row.get("reason", "") or "",
             superseded_by=row.get("superseded_by", "") or "",
@@ -130,7 +145,10 @@ class AuditReport:
         lines = [f"=== audit: {self.episode_id} | {'OK' if self.ok else 'VIOLATIONS'} ==="]
         for name, result in self.invariants.items():
             mark = "ok " if result.get("ok") else "FAIL"
-            detail = ", ".join(f"{k}={v}" for k, v in result.items() if k != "ok")
+            detail = ", ".join(
+                f"{k}=<{len(v)} item(s)>" if isinstance(v, (list, dict, tuple)) else f"{k}={v}"
+                for k, v in result.items() if k != "ok"
+            )
             lines.append(f"  [{mark}] {name:34} {detail}")
         if self.counters:
             lines.append(f"  counters: {self.counters}")
@@ -302,7 +320,10 @@ def render_current_values(summaries, max_slots: int = 12) -> str:
     return "; ".join(f"{slot}={value}" for slot, value, _ in items)
 
 
-def audit_episode(store, episode_id: str, gold_facts=None, max_slots: int = 12) -> AuditReport:
+def audit_episode(
+    store, episode_id: str, gold_facts=None, max_slots: int = 12,
+    extraction_min_recall: float = 0.0,
+) -> AuditReport:
     """
     Audit a **persisted** episode without a live manager.
 
@@ -342,7 +363,111 @@ def audit_episode(store, episode_id: str, gold_facts=None, max_slots: int = 12) 
         ),
         raw_lookup=_raw_lookup,
         gold_facts=gold_facts,
+        raw_records=store.list_raw_records(episode_id),
+        extraction_min_recall=extraction_min_recall,
     )
+
+
+def normalise_fact(text: str) -> str:
+    """Case/punctuation-insensitive form used to compare candidate to captured."""
+    return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+
+
+def _value_matches(candidate: str, captured: Set[str]) -> bool:
+    """
+    Does the memory hold this candidate value?
+
+    Containment, not equality: the candidate detector reads verbatim text, so it
+    keeps trailing particles ("下午2点**了**") and English adverbs ("alpha **now**")
+    that the summariser's value cleaner strips.  Requiring equality made a perfectly
+    correct extraction look like a miss and reported recall 0.0 on clean data.
+    Short strings fall back to equality so "3" does not match "30".
+    """
+    normalised = normalise_fact(candidate)
+    if not normalised:
+        return False
+    for have in captured:
+        if not have:
+            continue
+        if normalised == have:
+            return True
+        if len(normalised) >= 2 and len(have) >= 2 and (
+            normalised in have or have in normalised
+        ):
+            return True
+    return False
+
+
+def extraction_report(
+    raw_records: Sequence[Any],
+    ledger_entries: Sequence[FactRecord],
+    max_gaps: int = 20,
+    scope: str = "user",
+) -> Dict[str, Any]:
+    """
+    How much of what was *said* actually made it into the memory?
+
+    I1-I3 audit the storage path: once a fact is extracted, nothing can lose it.  None
+    of them can see a fact that was **never extracted** -- the single real gap the M1
+    run exposed (``silent_loss_rate = 0.2`` with every storage invariant passing).
+    With no ground truth available at runtime, the independent signal is a high
+    -precision lexical detector over the *original turn text*: whatever it finds and
+    the memory did not record is a reported gap rather than an invisible one.
+
+    Two denominators are returned on purpose:
+
+    * ``strict_candidates`` -- turns carrying an explicit change verb or ``X=Y``.
+      This is the defensible recall figure: the detector rarely fires by accident
+      here, so a gap is very likely a real miss.
+    * ``all_candidates`` -- every pattern hit, including weak copula matches.  On
+      conversational text these over-generate (a question such as "…是**怎么**配合
+      的" looks like a fact), so the count is reported for coverage only and is not
+      used for the recall figure.
+    """
+    by_turn: Dict[int, List[FactRecord]] = {}
+    for record in ledger_entries:
+        by_turn.setdefault(record.observed_turn, []).append(record)
+
+    strict_total = strict_captured = 0
+    loose_total = loose_captured = 0
+    gaps: List[Dict[str, Any]] = []
+    for raw in raw_records:
+        # ``scope="user"`` by default: the *user's* words are where a fact the memory
+        # must keep is stated.  Including the assistant reply swamped the synthetic set
+        # with false candidates ("把中间格式换成列式之后" inside a confident filler
+        # answer), which made a correct extraction look like a miss.
+        if scope == "both":
+            text = f"{getattr(raw, 'user_msg', '')}\n{getattr(raw, 'agent_msg', '')}"
+        else:
+            text = getattr(raw, "user_msg", "") or ""
+        candidates = extract_candidate_pairs(text)
+        if not candidates:
+            continue
+        turn = getattr(raw, "turn_index", -1)
+        have = {normalise_fact(r.value) for r in by_turn.get(turn, [])}
+        strong = classify(text) == CHANGE
+        for slot, value in candidates:
+            hit = _value_matches(value, have)
+            loose_total += 1
+            loose_captured += 1 if hit else 0
+            if strong:
+                strict_total += 1
+                strict_captured += 1 if hit else 0
+            if not hit and strong and len(gaps) < max_gaps:
+                gaps.append(
+                    {"turn": turn, "slot": slot, "value": value,
+                     "evidence": getattr(raw, "reference_id", "")}
+                )
+
+    return {
+        "strict_candidates": strict_total,
+        "strict_captured": strict_captured,
+        "strict_recall": round(strict_captured / strict_total, 4) if strict_total else None,
+        "all_candidates": loose_total,
+        "all_captured": loose_captured,
+        "all_recall": round(loose_captured / loose_total, 4) if loose_total else None,
+        "gaps": gaps,
+    }
 
 
 def verify_invariants(
@@ -356,6 +481,8 @@ def verify_invariants(
     raw_lookup,
     reason_counts: Optional[Dict[str, int]] = None,
     gold_facts: Optional[Iterable[tuple]] = None,
+    raw_records: Optional[Sequence[Any]] = None,
+    extraction_min_recall: float = 0.0,
 ) -> AuditReport:
     """
     Cross-check the ledger against the store and build the audit report.
@@ -413,11 +540,24 @@ def verify_invariants(
         "unreachable": len(unreachable),
     }
 
+    # --- I4 extraction completeness --------------------------------------- #
+    # Informational by default: a lexical detector over-generates, so a recall below
+    # 1.0 is expected rather than a defect.  Setting ``extraction_min_recall`` turns
+    # it into a violation for a deployment that knows its own floor.
+    extraction: Optional[Dict[str, Any]] = None
+    if raw_records is not None:
+        extraction = extraction_report(raw_records, entries)
+        recall = extraction["strict_recall"]
+        extraction["ok"] = recall is None or recall >= extraction_min_recall
+        extraction["min_recall"] = extraction_min_recall
+
     invariants = {
         "I1_fact_conservation": conservation,
         "I2_top_level_current_value_reachable": reachability,
         "I3_provenance_resolvable": provenance,
     }
+    if extraction is not None:
+        invariants["I4_extraction_completeness"] = extraction
     violations: List[str] = []
     if missing:
         violations.append(
@@ -433,6 +573,12 @@ def verify_invariants(
         violations.append(
             f"I3: {len(unresolved)} unresolved evidence pointer(s), "
             f"{without_evidence} fact(s) with no evidence at all"
+        )
+    if extraction is not None and not extraction["ok"]:
+        violations.append(
+            f"I4: extraction recall {extraction['strict_recall']} is below the "
+            f"configured floor {extraction_min_recall} "
+            f"({len(extraction['gaps'])} reported gap(s))"
         )
 
     counters: Dict[str, Any] = dict(ledger.stats())

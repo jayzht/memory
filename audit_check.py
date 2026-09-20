@@ -21,6 +21,10 @@ Two things are reported:
      dropped ``fact_keys``/``index_id`` (this is the defect that made every real
      hybrid run's index digests empty).  I2 must fire, because the derived
      current-value registry can no longer see any value.
+   * *Control C -- a dead extractor*: make the summariser extract nothing at all.
+     I1-I3 must keep passing (there is nothing to lose) and only I4 may notice --
+     this is the blind spot I4 exists for, and the shape of the M1 finding where
+     silent_loss_rate was 0.2 with every storage invariant green.
 """
 
 from __future__ import annotations
@@ -169,6 +173,31 @@ def main() -> int:
     if not fired_b:
         failures.append("control B did not trip I2")
 
+    # Control C -- a dead extractor (I4 only)
+    from unittest import mock as _mock
+
+    from memory3l.dataset import build_long_context_episodes as _build
+    from memory3l.llm import HeuristicLLM as _Heur
+
+    episode_c = _build(num_episodes=1, turns_per_episode=24, seed=777, language=args.language)[0]
+    with _mock.patch.object(_Heur, "extract_facts", side_effect=lambda text: []):
+        manager_c = run_episode(episode_c)
+    report_c = manager_c.verify(gold_facts=gold_pairs(episode_c))
+    extraction = report_c.invariants.get("I4_extraction_completeness", {})
+    storage_ok = all(
+        report_c.invariants[name]["ok"]
+        for name in ("I1_fact_conservation", "I2_top_level_current_value_reachable",
+                     "I3_provenance_resolvable")
+    )
+    fired_c = storage_ok and extraction.get("strict_captured") == 0 and bool(extraction.get("gaps"))
+    print(f"  [{'PASS' if fired_c else 'FAIL'}] 对照 C（抽取器完全失效）")
+    print(f"         期望：I1-I3 仍全部通过，只有 I4 报警 -> "
+          f"{'符合预期' if fired_c else '不符合预期！'}")
+    print(f"         I1-I3 全部 ok = {storage_ok} | I4 strict_captured = "
+          f"{extraction.get('strict_captured')} | gaps = {len(extraction.get('gaps') or [])}")
+    if not fired_c:
+        failures.append("control C did not show the storage invariants' blind spot")
+
     # ---------------------------------------------------------------- #
     print()
     if failures:
@@ -176,7 +205,7 @@ def main() -> int:
             print(f"!! 对照未按预期失败: {item}")
         print("→ 审计面不可信，必须先修检查本身。")
         return 1
-    print("结论: 审计面通过，且两个对照都按预期失败 —— 这些检查是有判别力的。")
+    print("结论: 审计面通过，且三个对照都按预期失败 —— 这些检查是有判别力的。")
     return 0
 
 

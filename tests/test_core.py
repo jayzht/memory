@@ -779,6 +779,82 @@ class TestFactLedgerAudit(unittest.TestCase):
         self.assertEqual(manager.render_current_values(), "")
 
 
+class TestExtractionCompleteness(unittest.TestCase):
+    """
+    I4 covers the one blind spot of I1-I3: a fact that was never extracted.
+
+    The storage invariants can only speak about facts the summariser produced, so a
+    broken *extractor* looks perfectly healthy to them.  This is not hypothetical --
+    the first M1 run reported silent_loss_rate 0.2 with every storage invariant
+    passing, caused entirely by three lexical-extraction bugs.
+    """
+
+    @staticmethod
+    def _run(*, broken_extractor: bool = False, threshold: float = 0.0):
+        """Run one episode; optionally with a completely dead fact extractor."""
+        import contextlib
+        from unittest import mock
+
+        from memory3l.dataset import build_long_context_episodes
+
+        episode = build_long_context_episodes(
+            num_episodes=1, turns_per_episode=24, seed=777, language="zh"
+        )[0]
+        with contextlib.ExitStack() as stack:
+            if broken_extractor:
+                # The summariser extracts nothing at all.  Every storage invariant
+                # still passes: there is simply nothing to store, and the system looks
+                # perfectly healthy while remembering nothing.
+                stack.enter_context(
+                    mock.patch.object(HeuristicLLM, "extract_facts",
+                                      side_effect=lambda text: [])
+                )
+            store = InMemoryStore(recent_window_turns=4)
+            manager = MemoryManager(
+                store, HeuristicLLM(), episode_id="ep_i4",
+                active_chain_token_limit=400, reset_on_bind=True,
+            )
+            for user, reply in episode.dialogues:
+                manager.add_dialog_turn(user, reply)
+            return manager.verify(extraction_min_recall=threshold)
+
+    def test_clean_run_reports_high_strict_recall(self):
+        extraction = self._run().invariants["I4_extraction_completeness"]
+        self.assertGreater(extraction["strict_candidates"], 0)
+        self.assertGreaterEqual(extraction["strict_recall"], 0.8)
+        self.assertEqual(extraction["gaps"], [])
+
+    def test_a_dead_extractor_is_invisible_to_the_storage_invariants(self):
+        """
+        The blind spot, demonstrated: with the extractor switched off, I1-I3 report a
+        clean system and only I4 notices that nothing was remembered at all.
+
+        This is exactly the shape of the M1 finding, where silent_loss_rate was 0.2
+        while all three storage invariants passed.
+        """
+        clean = self._run().invariants["I4_extraction_completeness"]
+        report = self._run(broken_extractor=True)
+        extraction = report.invariants["I4_extraction_completeness"]
+        self.assertLess(extraction["strict_recall"], clean["strict_recall"])
+        self.assertEqual(extraction["strict_captured"], 0)
+        self.assertTrue(extraction["gaps"], "a dead extractor must produce gaps")
+        for invariant in ("I1_fact_conservation", "I2_top_level_current_value_reachable",
+                          "I3_provenance_resolvable"):
+            self.assertTrue(report.invariants[invariant]["ok"],
+                            f"{invariant} must still pass -- nothing was stored to lose")
+
+    def test_recall_floor_turns_it_into_a_violation(self):
+        """
+        Informational by default (a lexical detector over-generates), but a deployment
+        that knows its floor can make a drop fail the audit.
+        """
+        self.assertTrue(self._run(threshold=0.0).ok)
+        report = self._run(broken_extractor=True, threshold=0.8)
+        self.assertFalse(report.ok)
+        self.assertFalse(report.invariants["I4_extraction_completeness"]["ok"])
+        self.assertTrue(any(v.startswith("I4:") for v in report.violations), report.violations)
+
+
 class TestLedgerPersistence(unittest.TestCase):
     """
     The ledger must outlive the process that wrote it.
@@ -833,6 +909,14 @@ class TestLedgerPersistence(unittest.TestCase):
         self.assertEqual(live.invariants, after.invariants)
         self.assertEqual(live.gold, after.gold)
         self.assertEqual(live.counters["ledger_facts"], after.counters["ledger_facts"])
+        # Regression: turn 0 is falsy, and `int(v or -1)` used to rewrite every
+        # first-turn fact as turn -1 on the way through the database.
+        reloaded = FactLedger(episode_id, store=reopened)
+        self.assertIsNotNone(reloaded.get(fact_id))
+        self.assertTrue(
+            any(r.observed_turn == 0 for r in reloaded.entries()),
+            "a fact recorded on turn 0 must survive persistence with turn 0 intact",
+        )
 
         # ...and the ledger is queryable, which is the whole point of the sidecar
         ledger = FactLedger(episode_id, store=reopened)
