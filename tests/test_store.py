@@ -21,7 +21,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from memory3l.models import ActiveSummary, ArchivedSummary, RawDialogRecord
+from memory3l.models import ActiveSummary, ArchivedSummary, IndexEntry, RawDialogRecord
 from memory3l.store import InMemoryStore, SQLiteColdStore
 from memory3l.store.hybrid_store import RedisSQLiteHybridStore
 from memory3l.store.redis_store import RedisHotStore
@@ -222,6 +222,80 @@ class TestRedisNamespacing(unittest.TestCase):
         store.rebuild_hot_state("ep_A")
         self.assertEqual(len(store.hot.list_active_summaries("ep_A")), 1)
         self.assertEqual(store.diagnostics["resyncs"], 1)
+
+
+class TestHotStateRoundTrip(unittest.TestCase):
+    """
+    Every dataclass field must survive the Redis hot path.
+
+    Regression: ``_load_summary`` dropped ``fact_keys``/``index_id`` and
+    ``loads_index`` dropped ``previews``/``child_index_ids``.  Because every real
+    experiment runs on the hybrid store, the hot path silently became poorer than
+    the cold one: index titles lost their ``属性=值`` digest, index lines fell back
+    to full member lines, and the lazy sweep re-wrote summaries on every turn.
+    """
+
+    def test_active_summary_fields_survive_the_hot_path(self):
+        import dataclasses
+
+        store, _fake, _cold = make_hybrid()
+        store.bind_episode("ep_A", reset=True)
+        summary = ActiveSummary(
+            summary_id="ep_A/s007@abc123",
+            text="工位换到 3 楼",
+            override_ids=["ep_A/s002@ffffff"],
+            timestamp=1234.5,
+            raw_ref_id="ep_A/raw007@aaaaaa",
+            episode_id="ep_A",
+            seq=7,
+            origin="event",
+            raw_ref_ids=["ep_A/raw007@aaaaaa", "ep_A/raw008@bbbbbb"],
+            merged_from=["ep_A/s001@cccccc"],
+            fact_keys=["工位=3楼"],
+            index_id="ep_A/idx003@dddddd",
+        )
+        store.add_active_summary(summary, episode_id="ep_A")
+
+        hot = store.hot.list_active_summaries("ep_A")[0]
+        cold = store.cold.list_active_summaries("ep_A")[0]
+        for label, back in (("hot", hot), ("cold", cold)):
+            for field in dataclasses.fields(ActiveSummary):
+                self.assertEqual(
+                    getattr(back, field.name), getattr(summary, field.name),
+                    f"ActiveSummary.{field.name} lost on the {label} path",
+                )
+
+    def test_index_entry_fields_survive_the_hot_path(self):
+        import dataclasses
+
+        store, _fake, _cold = make_hybrid()
+        store.bind_episode("ep_A", reset=True)
+        entry = IndexEntry(
+            index_id="ep_A/sidx002@abc123",
+            title="工位=3楼[12楼→3楼] ｜ 搬办公室",
+            members=["ep_A/s001@aaaaaa", "ep_A/s002@bbbbbb"],
+            span_start=10.0,
+            span_end=20.0,
+            turn_start=3,
+            turn_end=8,
+            fact_keys=["工位=3楼"],
+            episode_id="ep_A",
+            seq=11,
+            timestamp=99.0,
+            member_summaries=["- line one", "- line two"],
+            previews=["3楼", "12楼"],
+            child_index_ids=["ep_A/idx001@cccccc"],
+        )
+        store.add_index_entry(entry, episode_id="ep_A")
+
+        hot = store.hot.list_index_entries("ep_A")[0]
+        cold = store.cold.list_index_entries("ep_A")[0]
+        for label, back in (("hot", hot), ("cold", cold)):
+            for field in dataclasses.fields(IndexEntry):
+                self.assertEqual(
+                    getattr(back, field.name), getattr(entry, field.name),
+                    f"IndexEntry.{field.name} lost on the {label} path",
+                )
 
 
 class TestSQLitePersistence(unittest.TestCase):

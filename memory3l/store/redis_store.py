@@ -396,6 +396,13 @@ def _load_summary(raw: Any) -> ActiveSummary:
         origin=data.get("origin", "event"),
         raw_ref_ids=list(data.get("raw_ref_ids") or []),
         merged_from=list(data.get("merged_from") or []),
+        # ``fact_keys`` and ``index_id`` are *not* recoverable from ``text`` (the
+        # [FACTS: ...] line is stripped before storage) and they are load-bearing:
+        # fact_keys drive the fact-safety rule and the index digest, index_id drives
+        # the lazy sweep and the post-fold member re-pointing.  Dropping them here
+        # made the hot path behave differently from the cold one.
+        fact_keys=list(data.get("fact_keys") or []),
+        index_id=data.get("index_id", "") or "",
     )
 
 
@@ -424,6 +431,12 @@ def loads_index(raw: Any) -> IndexEntry:
         seq=int(d.get("seq", -1)),
         timestamp=d.get("timestamp") or 0.0,
         member_summaries=list(d.get("member_summaries") or []),
+        # ``previews`` is the *cheap* content of an index line.  Without it
+        # ``IndexEntry.render`` falls back to ``member_summaries`` (full summary
+        # lines), which makes the index layer cost what the chain it replaced cost.
+        # ``child_index_ids`` marks a super index; losing it breaks fold bookkeeping.
+        previews=list(d.get("previews") or []),
+        child_index_ids=list(d.get("child_index_ids") or []),
     )
 
 

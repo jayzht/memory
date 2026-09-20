@@ -88,6 +88,8 @@ CREATE TABLE IF NOT EXISTS index_entries (
     turn_start    INTEGER NOT NULL DEFAULT -1,
     turn_end      INTEGER NOT NULL DEFAULT -1,
     fact_keys     TEXT NOT NULL DEFAULT '',
+    previews      TEXT NOT NULL DEFAULT '',
+    child_index_ids TEXT NOT NULL DEFAULT '',
     timestamp     REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_index_episode ON index_entries(episode_id, seq);
@@ -167,6 +169,12 @@ class SQLiteColdStore:
             "archived_summaries": {"fact_keys": "TEXT NOT NULL DEFAULT ''"},
             "active_summaries": {"fact_keys": "TEXT NOT NULL DEFAULT ''",
                                  "index_id": "TEXT NOT NULL DEFAULT ''"},
+            # previews / child_index_ids were previously dropped on the SQLite
+            # round-trip.  Losing ``previews`` made every index line render the
+            # full member summaries instead of a ~10-token snippet; losing
+            # ``child_index_ids`` broke super-index bookkeeping.
+            "index_entries": {"previews": "TEXT NOT NULL DEFAULT ''",
+                              "child_index_ids": "TEXT NOT NULL DEFAULT ''"},
         }
         for table, columns in additions.items():
             existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
@@ -422,31 +430,50 @@ class SQLiteColdStore:
     # index entries (level 2 of layer 1)
     # ------------------------------------------------------------------ #
     def add_index_entry(self, entry) -> None:
+        import json
+
         self.execute(
             """INSERT INTO index_entries
                    (index_id, episode_id, seq, title, members, member_lines,
-                    span_start, span_end, turn_start, turn_end, fact_keys, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    span_start, span_end, turn_start, turn_end, fact_keys,
+                    previews, child_index_ids, timestamp)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(index_id) DO UPDATE SET
                    episode_id=excluded.episode_id, seq=excluded.seq, title=excluded.title,
                    members=excluded.members, member_lines=excluded.member_lines,
                    span_start=excluded.span_start, span_end=excluded.span_end,
                    turn_start=excluded.turn_start, turn_end=excluded.turn_end,
-                   fact_keys=excluded.fact_keys, timestamp=excluded.timestamp""",
+                   fact_keys=excluded.fact_keys, previews=excluded.previews,
+                   child_index_ids=excluded.child_index_ids, timestamp=excluded.timestamp""",
             (
                 entry.index_id, entry.episode_id, int(entry.seq), entry.title,
                 pack_refs(entry.members), pack_refs(entry.member_summaries),
                 float(entry.span_start), float(entry.span_end),
                 int(entry.turn_start), int(entry.turn_end),
-                pack_refs(entry.fact_keys), float(entry.timestamp),
+                pack_refs(entry.fact_keys),
+                # JSON, not pack_refs: a preview is free text and may contain "|".
+                json.dumps(list(entry.previews or []), ensure_ascii=False),
+                json.dumps(list(entry.child_index_ids or []), ensure_ascii=False),
+                float(entry.timestamp),
             ),
         )
 
     @staticmethod
     def _row_to_index(row) -> "IndexEntry":
+        import json
+
         from ..models import IndexEntry
 
         keys = row.keys()
+
+        def _json_list(column: str) -> List[str]:
+            if column not in keys or not row[column]:
+                return []
+            try:
+                return [str(item) for item in json.loads(row[column])]
+            except (TypeError, ValueError):
+                return []
+
         return IndexEntry(
             index_id=row["index_id"],
             title=row["title"],
@@ -460,6 +487,8 @@ class SQLiteColdStore:
             seq=row["seq"],
             timestamp=row["timestamp"],
             member_summaries=unpack_refs(row["member_lines"]) if "member_lines" in keys else [],
+            previews=_json_list("previews"),
+            child_index_ids=_json_list("child_index_ids"),
         )
 
     def list_index_entries(self, episode_id: Optional[str] = None) -> List["IndexEntry"]:
