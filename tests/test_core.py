@@ -507,6 +507,130 @@ class TestAnswerMatching(unittest.TestCase):
             self.assertFalse(string_match(prediction, gold), (prediction, gold))
 
 
+class TestSummaryGate(unittest.TestCase):
+    """
+    The content gate must skip information-free turns and keep fact-bearing ones.
+
+    Cost of a wrong decision is asymmetric: a false skip removes a fact from the
+    prompt once it leaves the sliding window, while a false summarise only costs a
+    call.  These tests pin the discrimination direction, not a tuned threshold.
+    """
+
+    FACT_ZH = "你好，跟你说一下，我的工位楼层是3楼。"
+    CHANGE_ZH = "对了，我的会议时间改成下午2点了。"
+    FILLER_ZH = "乐观锁和悲观锁在这里到底有什么区别？"
+    QUESTION_ABOUT_FACT = "再提醒我一下重试预算和熔断器是怎么配合的。"
+
+    def test_off_summarises_everything(self):
+        from memory3l.gate import SummaryGate
+
+        gate = SummaryGate("off")
+        for text in (self.FACT_ZH, self.FILLER_ZH, self.CHANGE_ZH):
+            self.assertTrue(gate.should_summarise(text))
+
+    def test_pattern_keeps_facts_and_drops_filler(self):
+        from memory3l.gate import SummaryGate
+
+        gate = SummaryGate("pattern")
+        self.assertTrue(gate.should_summarise(self.FACT_ZH))
+        self.assertTrue(gate.should_summarise(self.CHANGE_ZH))
+        self.assertFalse(gate.should_summarise(self.FILLER_ZH))
+        # an interrogative clause is not a fact statement, even though it contains 是
+        self.assertFalse(gate.should_summarise(self.QUESTION_ABOUT_FACT))
+
+    def test_change_verb_survives_a_question_mark(self):
+        from memory3l.gate import SummaryGate
+
+        gate = SummaryGate("pattern")
+        self.assertTrue(gate.should_summarise("我把地址改成了上海，对吗？"))
+
+    def test_strict_requires_a_value_not_seen_before(self):
+        from memory3l.gate import SummaryGate
+
+        gate = SummaryGate("strict")
+        self.assertTrue(gate.should_summarise(self.CHANGE_ZH, seen_values=set()))
+        self.assertFalse(
+            gate.should_summarise(self.CHANGE_ZH, seen_values={"下午2点了"})
+        )
+
+    def test_english_turns(self):
+        from memory3l.gate import SummaryGate
+
+        gate = SummaryGate("pattern")
+        self.assertTrue(gate.should_summarise("My office floor is the 3rd."))
+        self.assertTrue(gate.should_summarise("I moved to Shanghai last week."))
+        self.assertFalse(gate.should_summarise("What is the difference between optimistic and pessimistic locking?"))
+
+    def test_possessive_change_restated_as_it_is(self):
+        """
+        "my X has changed - it is Y now" is how the English set states updates.
+
+        An ``I <verb>``-only rule missed every one of them: recall fell to 80% and
+        Current_Fact_Acc dropped from 31/32 to 23/32.
+        """
+        from memory3l.gate import SummaryGate, extract_candidate_pairs
+
+        turn = "By the way, my project codename has changed - it is otter now."
+        self.assertTrue(SummaryGate("pattern").should_summarise(turn))
+        values = [value for _slot, value in extract_candidate_pairs(turn)]
+        self.assertTrue(any("otter" in value for value in values), values)
+
+    def test_gate_unknown_level_is_rejected(self):
+        from memory3l.gate import SummaryGate
+
+        with self.assertRaises(ValueError):
+            SummaryGate("aggressive")
+
+
+class TestGatedManager(unittest.TestCase):
+    """A gated-out turn still lands in L3 + the window; only the call is skipped."""
+
+    def _manager(self, level):
+        store = InMemoryStore(recent_window_turns=4)
+        manager = MemoryManager(
+            store,
+            ScriptedLLM(lambda messages: "摘要\n[FACTS: 工位=3楼]\n[OVERRIDES: none]"),
+            episode_id="ep_gate",
+            active_chain_token_limit=10 ** 6,
+        )
+        manager.summary_gate = __import__("memory3l.gate", fromlist=["SummaryGate"]).SummaryGate(level)
+        return manager, store
+
+    def test_filler_turn_is_recorded_but_not_summarised(self):
+        manager, store = self._manager("pattern")
+        stats = manager.add_dialog_turn("乐观锁和悲观锁有什么区别？", "它们不一样。")
+        self.assertTrue(stats.summariser_skipped)
+        self.assertEqual(stats.new_summary_id, "", "no summary should have been created")
+        # ...but the turn is durable and visible
+        self.assertEqual(store.count_raw_records("ep_gate"), 1)
+        self.assertEqual(len(manager.get_window()), 1)
+        self.assertEqual(manager.list_active_summaries(), [])
+
+    def test_fact_turn_is_still_summarised(self):
+        manager, store = self._manager("pattern")
+        stats = manager.add_dialog_turn("我的工位楼层是3楼。", "好的")
+        self.assertFalse(stats.summariser_skipped)
+        self.assertTrue(stats.new_summary_id)
+        self.assertEqual(len(manager.list_active_summaries()), 1)
+
+    def test_metrics_expose_the_skip_rate(self):
+        manager, _ = self._manager("pattern")
+        manager.add_dialog_turn("我的工位楼层是3楼。", "好的")
+        manager.add_dialog_turn("什么是乐观锁？", "一种锁。")
+        metrics = manager.episode_metrics()
+        self.assertEqual(metrics["turns_not_summarised"], 1)
+        self.assertEqual(metrics["turns_summarised"], 1)
+        self.assertEqual(metrics["gate_level"], "pattern")
+
+    def test_gate_is_bypassed_without_a_summariser(self):
+        """No LLM means the turn *is* the summary; skipping would drop it entirely."""
+        store = InMemoryStore(recent_window_turns=4)
+        manager = MemoryManager(store, None, episode_id="ep_gate2")
+        manager.summary_gate = __import__("memory3l.gate", fromlist=["SummaryGate"]).SummaryGate("strict")
+        manager.add_dialog_turn("什么是乐观锁？", "一种锁。")
+        self.assertEqual(len(manager.list_active_summaries()), 1)
+
+
 class TestLongMemEvalAdapter(unittest.TestCase):
     """
     The adapter decides what a "question" even is, so its truncation and filtering

@@ -396,6 +396,9 @@ class MemoryTurnStats:
     summarizer_raw_output: str = ""
     format_retry_used: bool = False   # summariser omitted the OVERRIDES tag once
     summary_truncated: bool = False    # summary body hit the hard token ceiling
+    #: True when the turn was recorded (raw + window) but the paid summariser call
+    #: was skipped by the content gate because the turn carried no fact update.
+    summariser_skipped: bool = False
     #: True when this turn's summary came from the answering call itself
     #: (``<MEMORY_UPDATE>`` block) instead of a dedicated summariser call.
     self_written: bool = False

@@ -159,6 +159,19 @@ INDEX_MAX_PER_TURN: int = _env_int("INDEX_MAX_PER_TURN", 2)
 # carry it -- and index titles truncate, go stale on override, and are recomputed
 # per group.  With the registry, "what is X now?" is answerable from the top level
 # of the prompt no matter how the summaries are filed.
+# --- summariser content gate (off by default) ----------------------------- #
+# Skip the paid summariser call for turns that carry no fact update.  Measured on
+# the long synthetic set: gating out filler turns removed 46.8% of ALL prompt
+# tokens with no accuracy change (a filler turn has no information to lose, unlike
+# batch summarisation which coarsens information-bearing turns).
+#   off      summarise every turn (original behaviour)
+#   loose    summarise if the turn states a fact OR mentions a known slot
+#   pattern  summarise only if it states a fact
+#   strict   summarise only if it states a fact with a value not seen before
+# The cost of a wrong decision is asymmetric (a false skip loses a fact once it
+# leaves the sliding window), so this defaults to off until swept.
+SUMMARY_GATE: str = _env_str("SUMMARY_GATE", "off").lower()
+
 CURRENT_VALUES_ENABLED: bool = _env_bool("CURRENT_VALUES_ENABLED", True)
 # Hard cap on registry entries.  Recency wins when an episode has many slots.
 CURRENT_VALUES_MAX_SLOTS: int = _env_int("CURRENT_VALUES_MAX_SLOTS", 12)

@@ -60,6 +60,7 @@ from .prompts import (
     summarizer_system_prompt,
     summarizer_user_prompt,
 )
+from .gate import SummaryGate, extract_candidate_pairs
 from .store.base import BaseMemoryStore
 from .token_utils import estimate_tokens, extract_fact_keys, truncate_to_tokens
 from .tools import SummaryParseError, parse_summary_response
@@ -200,6 +201,13 @@ class MemoryManager:
         #: a turn is summarised against the chain produced by *every* earlier turn;
         #: >1 trades that guarantee for wall clock -- see ``add_dialog_turns``.
         self.ingest_concurrency = 1
+        #: Optional LLM-free pre-filter: is this turn worth a summariser call?
+        #: ``off`` reproduces the original "summarise every turn" behaviour.
+        self.summary_gate = SummaryGate(getattr(config, "SUMMARY_GATE", "off"))
+        #: Slot / value lexicon grown from the summaries themselves, so the gate
+        #: needs no external attribute list (see memory3l/gate.py).
+        self._slot_lexicon: set = set()
+        self._seen_values: set = set()
         # The manager is the authority on the window size: make sure the store
         # enforces exactly the same bound (they are configured independently).
         self.store.recent_window_turns = self.recent_window_turns
@@ -270,6 +278,12 @@ class MemoryManager:
         self.summarizer_failures = 0
         self.summary_truncations = 0
         self.capacity_merges_rejected = 0
+        # Rebuild the gate lexicon from whatever is already on the chain, so a
+        # resumed episode keeps the same notion of "known slot / seen value".
+        self._slot_lexicon = set()
+        self._seen_values = set()
+        for summary in self.store.list_active_summaries(episode_id):
+            self._remember_fact_keys(summary.fact_keys or extract_fact_keys(summary.text))
         logger.debug(
             "episode %s reset (resume=%s): hot state cleared, next turn=%d",
             episode_id, resume, self.turn_index + 1,
@@ -460,6 +474,12 @@ class MemoryManager:
         one entry point and not the other.
         """
         record, stats = self._prepare_turn(user_input, agent_output)
+        if not self.should_summarise_turn(user_input, agent_output):
+            # Raw record + sliding window are already written: only the paid
+            # summariser call is skipped.  Nothing else about the turn is lost.
+            stats.summariser_skipped = True
+            self._after_turn(stats)
+            return stats
         gen = self._generate_only(record)
         self._apply_generated(gen, stats)
         self._after_turn(stats)
@@ -546,6 +566,42 @@ class MemoryManager:
                 f"{facts} (raw_ref: {self.short_id(item.raw_ref_id)}) {item.text}"
             )
         return "\n".join(lines)
+
+    def _remember_fact_keys(self, fact_keys) -> None:
+        """Grow the slot/value lexicon from a summary's ``[FACTS:]`` keys."""
+        for key in fact_keys or ():
+            if "=" not in key:
+                continue
+            slot, _, value = key.partition("=")
+            slot = self._slot_of(key)
+            value = value.strip().lower()
+            if slot:
+                self._slot_lexicon.add(slot)
+            if value:
+                self._seen_values.add(value)
+
+    def should_summarise_turn(self, user_input: str, agent_output: str = "") -> bool:
+        """
+        Ask the gate whether this turn deserves a summariser call.
+
+        Only consulted when a summariser is attached: with no LLM the "summary" is
+        the verbatim turn, and skipping it would silently drop a record from the
+        chain instead of saving a call.
+        """
+        if self.summarizer is None:
+            return True
+        turn_text = f"{user_input}\n{agent_output}"
+        pairs = extract_candidate_pairs(turn_text)
+        # Ask *before* remembering: "is this value new?" must be judged against what
+        # the memory already knew.  Adding the turn's own values first made every
+        # value look already-seen and the strict level skipped every single turn.
+        decision = self.summary_gate.should_summarise(
+            turn_text, known_slots=tuple(self._slot_lexicon), seen_values=self._seen_values
+        )
+        # Remember either way: a skipped turn is never re-read later.
+        for _slot, value in pairs:
+            self._seen_values.add(value)
+        return decision
 
     def _generate_only(self, record: RawDialogRecord) -> Dict[str, Any]:
         """
@@ -694,6 +750,7 @@ class MemoryManager:
         stats.new_summary_id = new_summary.summary_id
         stats.overridden_ids = archived_ids
         stats.event_triggered = bool(archived_ids)
+        self._remember_fact_keys(new_summary.fact_keys)
         return new_summary
 
     def add_dialog_turns(self, turns: Sequence[tuple]) -> List[MemoryTurnStats]:
@@ -737,20 +794,28 @@ class MemoryManager:
             chunk = turns[start : start + window]
             records: List[RawDialogRecord] = []
             stats_list: List[MemoryTurnStats] = []
+            kept_flags: List[bool] = []
             for offset, (user_input, agent_output) in enumerate(chunk):
                 index = start + offset
                 record, stats = self._prepare_turn(user_input, agent_output)
+                kept = self.should_summarise_turn(user_input, agent_output)
+                stats.summariser_skipped = not kept
                 records.append(record)
                 stats_list.append(stats)
+                kept_flags.append(kept)
                 # Publish this turn's raw record + window entry before generating, so
                 # the window reflects the dialogue so far (raw records never feed the
                 # override decision, so this is safe).
+            todo = [r for r, keep in zip(records, kept_flags) if keep]
             import concurrent.futures as _cf
 
-            with _cf.ThreadPoolExecutor(max_workers=min(window, len(records))) as pool:
-                generated = list(pool.map(self._generate_only, records))
-            for offset, (gen, stats) in enumerate(zip(generated, stats_list)):
-                self._apply_generated(gen, stats, seq=reservations[start + offset])
+            with _cf.ThreadPoolExecutor(max_workers=max(1, min(window, len(todo)))) as pool:
+                generated = list(pool.map(self._generate_only, todo)) if todo else []
+            generated_iter = iter(generated)
+            for offset, stats in enumerate(stats_list):
+                if kept_flags[offset]:
+                    self._apply_generated(next(generated_iter), stats,
+                                          seq=reservations[start + offset])
                 self._after_turn(stats)
                 results.append(stats)
         return results
@@ -1511,6 +1576,9 @@ class MemoryManager:
             "chain_strategy": self.chain_strategy,
             "capacity_merges_rejected": self.capacity_merges_rejected,
             "summarizer_failures": self.summarizer_failures,
+            "turns_summarised": sum(1 for s in self.stats if not s.summariser_skipped),
+            "turns_not_summarised": sum(1 for s in self.stats if s.summariser_skipped),
+            **self.summary_gate.stats(),
             "window_turns": len(self.get_window()),
         }
 
