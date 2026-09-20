@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import config
+from .. import config
 
 from ..llm import BaseLLM, LLMError
 from ..memory_manager import MemoryManager

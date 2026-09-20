@@ -48,7 +48,7 @@ class RedisSQLiteHybridStore(BaseMemoryStore):
     ):
         super().__init__(recent_window_turns)
         # Imported lazily so the module can be inspected without config side effects.
-        import config
+        from .. import config
 
         if sqlite_store is None:
             sqlite_store = SQLiteColdStore(sqlite_path or config.SQLITE_PATH)

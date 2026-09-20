@@ -209,7 +209,7 @@ class IndexEntry:
         # The cap is a config knob: the digest is built from several attributes, and
         # a hard 60 chars discarded most of it while the builder allowed 220.
         try:
-            import config
+            from . import config
 
             limit = int(getattr(config, "INDEX_TITLE_CHARS", 0) or self.MAX_TITLE_CHARS)
         except Exception:  # pragma: no cover - config is always importable in practice

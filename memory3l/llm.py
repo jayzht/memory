@@ -32,7 +32,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-import config
+from . import config
 from .token_utils import estimate_tokens
 
 logger = logging.getLogger(__name__)

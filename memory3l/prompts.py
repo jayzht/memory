@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 from typing import List, Optional, Sequence
 
-import config
+from . import config
 
 from .models import ActiveSummary, IndexEntry, RawDialogRecord
 

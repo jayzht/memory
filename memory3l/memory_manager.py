@@ -39,7 +39,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
-import config
+from . import config
 
 from .llm import BaseLLM, LLMError
 from .models import (
