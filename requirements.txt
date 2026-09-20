@@ -1,0 +1,17 @@
+# Core runtime dependencies (always needed)
+requests>=2.28
+
+# --- optional -------------------------------------------------------------
+# Redis hot layer. Without it the hybrid store still runs (SQLite-only,
+# degraded hot cache) -- see README section 3.
+# redis>=5.0
+#
+# Exact token counts for Avg_Active_Chain_Tokens. Without it a deterministic
+# character-class estimator is used and reported in run_metadata_*.json.
+# tiktoken>=0.5
+#
+# OpenAI-compatible HTTP backends (raw requests fallback exists without it).
+# openai>=1.0
+#
+# Loading MEME straight from the HuggingFace hub.
+# datasets>=2.18

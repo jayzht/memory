@@ -1,0 +1,23 @@
+19:46:19 INFO    memory3l.longmemeval: LongMemEval: 4 episodes (of 4 scanned) | types: {'single-session-user': 4} | max_turns=60
+19:46:19 INFO    evaluation: run_id=lme_pilot | systems=['three_layer'] | episodes=4 | store=redis_sqlite_hybrid | llm=ollama/deepseek-r1:14b | window=4 | chain_limit=400 | tokenizer=heuristic:v1
+19:46:19 INFO    evaluation: hybrid store: Redis=hot (episode:{episode_id}:*) SQLite=./exp_lme.db cold+checkpoint
+19:46:19 INFO    evaluation: LLM backend=ollama model=deepseek-r1:14b summarizer=deepseek-r1:14b
+19:46:20 INFO    evaluation: [three_layer] system ready (tool-capable=True)
+19:46:20 INFO    evaluation: [three_layer] episode 1/4 lme_e47becba (30 turns, 1 probes)
+19:46:58 INFO    memory3l.memory_manager: hierarchy at turn 5: 1 new index entry, rendered chain 339 tok (budget 400), 3 unfiled / 3 filed / 0 lazy
+19:47:07 INFO    memory3l.memory_manager: hierarchy at turn 6: 1 new index entry, rendered chain 295 tok (budget 400), 2 unfiled / 5 filed / 0 lazy
+19:47:28 INFO    memory3l.memory_manager: hierarchy at turn 9: 1 new index entry, rendered chain 342 tok (budget 400), 2 unfiled / 7 filed / 0 lazy
+19:47:46 INFO    memory3l.memory_manager: hierarchy at turn 11: 1 new index entry, rendered chain 317 tok (budget 400), 2 unfiled / 9 filed / 0 lazy
+19:48:00 INFO    memory3l.memory_manager: hierarchy at turn 13: 1 new index entry, rendered chain 343 tok (budget 400), 2 unfiled / 11 filed / 0 lazy
+19:48:13 INFO    memory3l.memory_manager: super index built at turn 15: 4 index entries folded
+19:48:22 INFO    memory3l.memory_manager: hierarchy at turn 16: 1 new index entry, rendered chain 315 tok (budget 400), 2 unfiled / 13 filed / 0 lazy
+19:48:28 INFO    memory3l.memory_manager: super index built at turn 17: 3 index entries folded
+19:48:39 INFO    memory3l.memory_manager: hierarchy at turn 18: 1 new index entry, rendered chain 267 tok (budget 400), 2 unfiled / 15 filed / 0 lazy
+19:48:57 INFO    memory3l.memory_manager: hierarchy at turn 20: 1 new index entry, rendered chain 329 tok (budget 400), 2 unfiled / 17 filed / 0 lazy
+19:49:04 INFO    memory3l.memory_manager: super index built at turn 21: 3 index entries folded
+19:49:25 INFO    memory3l.memory_manager: hierarchy at turn 23: 1 new index entry, rendered chain 363 tok (budget 400), 2 unfiled / 19 filed / 0 lazy
+19:49:29 INFO    memory3l.memory_manager: super index built at turn 24: 2 index entries folded
+19:49:54 INFO    memory3l.memory_manager: hierarchy at turn 27: 1 new index entry, rendered chain 336 tok (budget 400), 2 unfiled / 21 filed / 0 lazy
+19:50:13 INFO    evaluation: [three_layer] episode 2/4 lme_118b2229 (29 turns, 1 probes)
+19:51:08 INFO    memory3l.memory_manager: hierarchy at turn 6: 1 new index entry, rendered chain 275 tok (budget 400), 3 unfiled / 3 filed / 0 lazy
+19:51:19 INFO    memory3l.memory_manager: hierarchy at turn 7: 1 new index entry, rendered chain 303 tok (budget 400), 2 unfiled / 5 filed / 0 lazy

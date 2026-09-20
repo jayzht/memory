@@ -1,0 +1,290 @@
+"""
+Store-level tests: episode isolation, Redis namespacing, SQLite persistence and
+batch checkpointing.
+
+Redis is exercised through a small in-process fake that implements exactly the
+commands ``RedisHotStore`` uses (list/hash/scan/unlink/ping/pipeline), so the
+namespace and reset semantics are verified *without* a Redis server:
+
+* keys are ``episode:{episode_id}:...`` and cannot collide between episodes;
+* ``reset(episode_id)`` deletes exactly that episode's keys and nothing else;
+* the SQLite cold layer keeps the archive and raw records across resets.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from memory3l.models import ActiveSummary, ArchivedSummary, RawDialogRecord
+from memory3l.store import InMemoryStore, SQLiteColdStore
+from memory3l.store.hybrid_store import RedisSQLiteHybridStore
+from memory3l.store.redis_store import RedisHotStore
+
+
+class FakePipeline:
+    def __init__(self, fake):
+        self.fake = fake
+        self.ops = []
+
+    def delete(self, *keys):
+        self.ops.append(("delete", keys))
+
+    def rpush(self, key, *values):
+        self.ops.append(("rpush", (key,) + values))
+
+    def ltrim(self, key, start, stop):
+        self.ops.append(("ltrim", (key, start, stop)))
+
+    def lrange(self, key, start, stop):
+        self.ops.append(("lrange", (key, start, stop)))
+
+    def lrem(self, key, count, value):
+        self.ops.append(("lrem", (key, count, value)))
+
+    def hset(self, key, field=None, value=None, mapping=None):
+        self.ops.append(("hset", (key, field, value, mapping)))
+
+    def hdel(self, key, *fields):
+        self.ops.append(("hdel", (key,) + fields))
+
+    def execute(self):
+        results = []
+        for name, args in self.ops:
+            results.append(getattr(self.fake, name)(*args))
+        self.ops.clear()
+        return results
+
+
+class FakeRedis:
+    """Minimal stand-in for redis-py (strings/lists/hashes/scan/unlink)."""
+
+    def __init__(self):
+        self.store = {}
+
+    # -- plumbing --------------------------------------------------------- #
+    def pipeline(self, transaction=True):
+        return FakePipeline(self)
+
+    def ping(self):
+        return True
+
+    # -- strings / hashes -------------------------------------------------- #
+    def hset(self, key, field=None, value=None, mapping=None):
+        table = self.store.setdefault(key, {})
+        if mapping:
+            table.update(mapping)
+        elif field is not None:
+            table[field] = value
+        return 1
+
+    def hget(self, key, field):
+        return self.store.get(key, {}).get(field)
+
+    def hmget(self, key, *fields):
+        table = self.store.get(key, {})
+        return [table.get(field) for field in fields]
+
+    def hdel(self, key, *fields):
+        table = self.store.get(key, {})
+        removed = 0
+        for field in fields:
+            if field in table:
+                del table[field]
+                removed += 1
+        return removed
+
+    # -- lists ------------------------------------------------------------- #
+    def rpush(self, key, *values):
+        self.store.setdefault(key, []).extend(values)
+        return len(self.store[key])
+
+    def lrange(self, key, start, stop):
+        items = list(self.store.get(key, []))
+        if stop == -1:
+            return items[start:]
+        return items[start : stop + 1]
+
+    def ltrim(self, key, start, stop):
+        items = list(self.store.get(key, []))
+        self.store[key] = items[start:] if stop == -1 else items[start : stop + 1]
+        return True
+
+    def llen(self, key):
+        return len(self.store.get(key, []))
+
+    def lrem(self, key, count, value):
+        items = self.store.get(key, [])
+        self.store[key] = [i for i in items if i != value]
+        return len(items) - len(self.store[key])
+
+    # -- keyspace ---------------------------------------------------------- #
+    def scan(self, cursor=0, match=None, count=500):
+        keys = [k for k in self.store if match is None or fnmatch.fnmatch(k, match)]
+        return 0, keys
+
+    def delete(self, *keys):
+        removed = 0
+        for key in keys:
+            removed += 1 if self.store.pop(key, None) is not None else 0
+        return removed
+
+    def unlink(self, *keys):
+        return self.delete(*keys)
+
+
+def make_hybrid(**kwargs):
+    fake = FakeRedis()
+    hot = RedisHotStore(key_prefix="episode:{episode_id}", client=fake)
+    cold = SQLiteColdStore(":memory:")
+    store = RedisSQLiteHybridStore(redis_store=hot, sqlite_store=cold, **kwargs)
+    return store, fake, cold
+
+
+class TestRedisNamespacing(unittest.TestCase):
+    def test_key_layout(self):
+        store, fake, _ = make_hybrid()
+        store.bind_episode("ep_A")
+        store.add_active_summary(
+            ActiveSummary(summary_id="ep_A/s001@aaaaaa", text="t", episode_id="ep_A", seq=1)
+        )
+        keys = sorted(fake.store.keys())
+        self.assertTrue(all(key.startswith("episode:ep_A:") for key in keys), keys)
+        self.assertIn("episode:ep_A:active_ids", keys)
+        self.assertIn("episode:ep_A:active", keys)
+
+    def test_episodes_never_collide(self):
+        store, fake, _ = make_hybrid()
+        store.bind_episode("ep_A", reset=True)
+        store.add_active_summary(
+            ActiveSummary(summary_id="ep_A/s001@aaaaaa", text="A", episode_id="ep_A", seq=1)
+        )
+        store.bind_episode("ep_B", reset=True)
+        store.add_active_summary(
+            ActiveSummary(summary_id="ep_B/s001@bbbbbb", text="B", episode_id="ep_B", seq=1)
+        )
+        self.assertEqual(len(store.list_active_summaries("ep_A")), 1)
+        self.assertEqual(len(store.list_active_summaries("ep_B")), 1)
+        self.assertEqual(store.list_active_summaries("ep_A")[0].text, "A")
+        self.assertEqual(store.list_active_summaries("ep_B")[0].text, "B")
+
+    def test_reset_deletes_only_that_episode_and_keeps_cold_data(self):
+        store, fake, cold = make_hybrid()
+        for episode in ("ep_A", "ep_B"):
+            store.bind_episode(episode, reset=True)
+            store.add_raw_record(
+                RawDialogRecord(reference_id=f"{episode}/raw000@aaaaaa", user_msg="u",
+                                agent_msg="a", episode_id=episode, turn_index=0),
+                episode_id=episode,
+            )
+            store.add_active_summary(
+                ActiveSummary(summary_id=f"{episode}/s001@aaaaaa", text="t",
+                              episode_id=episode, seq=1, raw_ref_id=f"{episode}/raw000@aaaaaa")
+            )
+            store.add_archived_summary(
+                ArchivedSummary(
+                    summary_id=f"{episode}/a001@aaaaaa", text="old", episode_id=episode
+                )
+            )
+        self.assertTrue(any(key.startswith("episode:ep_A:") for key in fake.store))
+        store.reset(episode_id="ep_A")
+        self.assertFalse(any(key.startswith("episode:ep_A:") for key in fake.store),
+                         "reset must delete every key of the episode namespace")
+        self.assertTrue(any(key.startswith("episode:ep_B:") for key in fake.store),
+                        "reset must not touch another episode")
+        self.assertEqual(cold.count_raw_records("ep_A"), 1, "cold raw data is permanent")
+        self.assertEqual(cold.count_archived_summaries("ep_A"), 1, "archive is permanent")
+        self.assertEqual(store.list_active_summaries("ep_A"), [])
+
+    def test_redis_failure_degrades_to_sqlite(self):
+        store, fake, _ = make_hybrid()
+        store.bind_episode("ep_A", reset=True)
+        store.add_active_summary(
+            ActiveSummary(summary_id="ep_A/s001@aaaaaa", text="t", episode_id="ep_A", seq=1)
+        )
+        fake.store.clear()  # simulate losing the hot layer
+        summaries = store.list_active_summaries("ep_A")
+        self.assertEqual(len(summaries), 1, "cold mirror must serve the active chain")
+        self.assertGreaterEqual(store.diagnostics["fallbacks"], 1)
+
+    def test_resume_rebuilds_hot_state(self):
+        store, fake, _ = make_hybrid()
+        store.bind_episode("ep_A", reset=True)
+        store.add_active_summary(
+            ActiveSummary(summary_id="ep_A/s001@aaaaaa", text="t", episode_id="ep_A", seq=1)
+        )
+        fake.store.clear()
+        store.rebuild_hot_state("ep_A")
+        self.assertEqual(len(store.hot.list_active_summaries("ep_A")), 1)
+        self.assertEqual(store.diagnostics["resyncs"], 1)
+
+
+class TestSQLitePersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp, "test.db")
+
+    def test_tables_are_created_and_data_survives_reopen(self):
+        cold = SQLiteColdStore(self.db_path)
+        cold.add_raw_record(
+            RawDialogRecord(reference_id="ep/raw000@aaaaaa", user_msg="hello", agent_msg="hi",
+                            episode_id="ep", turn_index=0)
+        )
+        cold.mark_episode_done("ep", run_id="run1", num_turns=1)
+        cold.close()
+
+        reopened = SQLiteColdStore(self.db_path)
+        record = reopened.get_raw_record("ep/raw000@aaaaaa")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.user_msg, "hello")
+        self.assertEqual(reopened.get_done_episodes("run1"), {"ep"})
+        counts = reopened.table_counts()
+        for table in ("raw_records", "archived_summaries", "active_summaries",
+                      "sliding_window", "episode_progress"):
+            self.assertIn(table, counts)
+        reopened.close()
+
+    def test_archived_roundtrip_preserves_fields(self):
+        cold = SQLiteColdStore(":memory:")
+        archived = ArchivedSummary(
+            summary_id="ep/a001@aaaaaa",
+            text="home city=Beijing",
+            override_ids=["ep/s000@000000"],
+            raw_ref_id="ep/raw000@aaaaaa",
+            is_overridden=True,
+            episode_id="ep",
+            seq=3,
+            superseded_by="ep/s005@555555",
+            archive_reason="overridden",
+            raw_ref_ids=["ep/raw000@aaaaaa", "ep/raw001@111111"],
+        )
+        cold.add_archived_summary(archived)
+        loaded = cold.get_archived_summary("ep/a001@aaaaaa")
+        self.assertEqual(loaded.text, archived.text)
+        self.assertEqual(loaded.override_ids, archived.override_ids)
+        self.assertEqual(loaded.raw_ref_ids, archived.raw_ref_ids)
+        self.assertTrue(loaded.is_overridden)
+        self.assertEqual(loaded.superseded_by, archived.superseded_by)
+        self.assertEqual(loaded.seq, 3)
+
+
+class TestInMemoryStore(unittest.TestCase):
+    def test_reset_isolates_episodes(self):
+        store = InMemoryStore(recent_window_turns=1)
+        store.bind_episode("A", reset=True)
+        store.add_active_summary(ActiveSummary(summary_id="A/s1@aaaaaa", text="A", episode_id="A", seq=1))
+        store.bind_episode("B", reset=True)
+        store.add_active_summary(ActiveSummary(summary_id="B/s1@bbbbbb", text="B", episode_id="B", seq=1))
+        self.assertEqual(len(store.list_active_summaries("A")), 1)
+        store.reset(episode_id="A")
+        self.assertEqual(store.list_active_summaries("A"), [])
+        self.assertEqual(len(store.list_active_summaries("B")), 1)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

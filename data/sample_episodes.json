@@ -1,0 +1,321 @@
+{
+  "episodes": [
+    {
+      "episode_id": "demo_zh_1",
+      "dialogues": [
+        [
+          "你好，我的工位在3楼。",
+          "好的，我记住了：你的工位在3楼。"
+        ],
+        [
+          "顺便说一下，我最喜欢的饮料是咖啡。",
+          "明白，你最喜欢咖啡。"
+        ],
+        [
+          "今天天气不错，我们去散步吧。",
+          "好呀。"
+        ],
+        [
+          "对了，我的工位改到7楼了。",
+          "已更新：你的工位现在是7楼。"
+        ],
+        [
+          "我最近开始喜欢喝茶了。",
+          "了解，你现在喜欢茶。"
+        ],
+        [
+          "下周的会议时间定在上午9点。",
+          "已记录：会议时间上午9点。"
+        ],
+        [
+          "会议改到下午2点了。",
+          "已更新：会议时间是下午2点。"
+        ],
+        [
+          "我的工位又调到了12楼。",
+          "已更新：工位现在是12楼。"
+        ]
+      ],
+      "facts": {
+        "office floor": [
+          [
+            "0",
+            "3楼"
+          ],
+          [
+            "3",
+            "7楼"
+          ],
+          [
+            "7",
+            "12楼"
+          ]
+        ],
+        "favourite drink": [
+          [
+            "1",
+            "咖啡"
+          ],
+          [
+            "4",
+            "茶"
+          ]
+        ],
+        "meeting time": [
+          [
+            "5",
+            "上午9点"
+          ],
+          [
+            "6",
+            "下午2点"
+          ]
+        ]
+      },
+      "probes": [
+        {
+          "type": "current_fact",
+          "fact_key": "office floor",
+          "question": "我现在的工位在几楼？",
+          "answer": "12楼"
+        },
+        {
+          "type": "history_fact",
+          "fact_key": "office floor",
+          "question": "在改成12楼之前，我的工位在哪一层？",
+          "answer": "7楼"
+        },
+        {
+          "type": "history_fact",
+          "fact_key": "office floor",
+          "question": "在改成7楼之前，我的工位在哪一层？",
+          "answer": "3楼"
+        },
+        {
+          "type": "current_fact",
+          "fact_key": "favourite drink",
+          "question": "我现在最喜欢的饮料是什么？",
+          "answer": "茶"
+        },
+        {
+          "type": "history_fact",
+          "fact_key": "favourite drink",
+          "question": "在改成茶之前，我最喜欢的饮料是什么？",
+          "answer": "咖啡"
+        },
+        {
+          "type": "current_fact",
+          "fact_key": "meeting time",
+          "question": "会议现在几点？",
+          "answer": "下午2点"
+        },
+        {
+          "type": "history_fact",
+          "fact_key": "meeting time",
+          "question": "会议原来定在几点？",
+          "answer": "上午9点"
+        }
+      ]
+    },
+    {
+      "episode_id": "demo_en_1",
+      "dialogues": [
+        [
+          "Hi, my home city is Beijing.",
+          "Got it, home city is Beijing."
+        ],
+        [
+          "I work on the falcon project.",
+          "Noted: falcon project."
+        ],
+        [
+          "The weather is nice today.",
+          "Yes it is."
+        ],
+        [
+          "I moved to Shanghai last month.",
+          "Updated: home city is Shanghai."
+        ],
+        [
+          "My team has 6 people now.",
+          "Noted: team size 6."
+        ],
+        [
+          "Let's grab lunch later.",
+          "Sure."
+        ],
+        [
+          "The project codename changed to otter.",
+          "Updated: codename is otter."
+        ],
+        [
+          "My team grew to 9 people.",
+          "Updated: team size 9."
+        ],
+        [
+          "Remind me what we changed today?",
+          "We changed your home city to Shanghai, codename to otter, and team size to 9."
+        ],
+        [
+          "My home city changed again - now it is Chengdu.",
+          "Updated: home city is Chengdu."
+        ]
+      ],
+      "facts": {
+        "home city": [
+          [
+            "0",
+            "Beijing"
+          ],
+          [
+            "3",
+            "Shanghai"
+          ],
+          [
+            "9",
+            "Chengdu"
+          ]
+        ],
+        "project codename": [
+          [
+            "1",
+            "falcon"
+          ],
+          [
+            "6",
+            "otter"
+          ]
+        ],
+        "team size": [
+          [
+            "4",
+            "6"
+          ],
+          [
+            "7",
+            "9"
+          ]
+        ]
+      },
+      "probes": [
+        {
+          "type": "current_fact",
+          "fact_key": "home city",
+          "question": "What is my home city now?",
+          "answer": "Chengdu"
+        },
+        {
+          "type": "history_fact",
+          "fact_key": "home city",
+          "question": "Before Chengdu, what was my home city?",
+          "answer": "Shanghai"
+        },
+        {
+          "type": "history_fact",
+          "fact_key": "home city",
+          "question": "What was my home city originally?",
+          "answer": "Beijing"
+        },
+        {
+          "type": "current_fact",
+          "fact_key": "project codename",
+          "question": "What is the project codename now?",
+          "answer": "otter"
+        },
+        {
+          "type": "history_fact",
+          "fact_key": "project codename",
+          "question": "What was the project codename before otter?",
+          "answer": "falcon"
+        },
+        {
+          "type": "current_fact",
+          "fact_key": "team size",
+          "question": "How many people are on my team now?",
+          "answer": "9"
+        },
+        {
+          "type": "history_fact",
+          "fact_key": "team size",
+          "question": "What was my team size before it became 9?",
+          "answer": "6"
+        }
+      ]
+    },
+    {
+      "episode_id": "demo_en_2_noupdate",
+      "dialogues": [
+        [
+          "I like hiking on weekends.",
+          "Noted."
+        ],
+        [
+          "My dog is called Momo.",
+          "Noted: dog Momo."
+        ],
+        [
+          "I drink tea in the morning.",
+          "Noted."
+        ],
+        [
+          "I work as a data engineer.",
+          "Noted."
+        ],
+        [
+          "My favourite author is Le Guin.",
+          "Noted."
+        ],
+        [
+          "I live in Hangzhou.",
+          "Noted."
+        ]
+      ],
+      "facts": {
+        "pet": [
+          [
+            "1",
+            "Momo"
+          ]
+        ],
+        "hobby": [
+          [
+            "0",
+            "hiking"
+          ]
+        ]
+      },
+      "probes": [
+        {
+          "type": "current_fact",
+          "fact_key": "pet",
+          "question": "What is my dog's name?",
+          "answer": "Momo"
+        },
+        {
+          "type": "current_fact",
+          "fact_key": "hobby",
+          "question": "What do I like doing on weekends?",
+          "answer": "hiking"
+        },
+        {
+          "type": "current_fact",
+          "fact_key": "job",
+          "question": "What is my job?",
+          "answer": "data engineer"
+        },
+        {
+          "type": "current_fact",
+          "fact_key": "author",
+          "question": "Who is my favourite author?",
+          "answer": "Le Guin"
+        },
+        {
+          "type": "current_fact",
+          "fact_key": "city",
+          "question": "Which city do I live in?",
+          "answer": "Hangzhou"
+        }
+      ]
+    }
+  ]
+}

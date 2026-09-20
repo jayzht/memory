@@ -1,0 +1,2 @@
+﻿system,episodes,Current_Fact_Acc,Current_Fact_n,History_Fact_Acc,History_Fact_n,Avg_Active_Chain_Tokens,Avg_Context_Tokens,Tool_Call_Success_Rate,chain_is_discrete,Tool_Calls,overrides_events,capacity_compressions,Avg_Archived,wall_time_s
+three_layer,5,0.925,40,0.8787878787878788,33,158.35999999999999,521.012,0.956140350877193,True,114,50,0,28.4,657.8100000000001

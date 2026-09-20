@@ -1,0 +1,20 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "记忆可视化: 启动服务",
+      "type": "shell",
+      "command": "./start_webui.sh",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always" },
+      "options": { "statusbar": { "label": "$(server-process) 记忆可视化", "color": "#6ea8fe" } }
+    },
+    {
+      "label": "记忆可视化: 检查/重启服务",
+      "type": "shell",
+      "command": "./check_webui.sh",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always" }
+    }
+  ]
+}

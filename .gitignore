@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pylibs/
+# large datasets & runtime DBs: keep the repo light
+data/longmemeval/
+*.db
+*.db-wal
+*.db-shm

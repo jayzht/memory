@@ -1,0 +1,2 @@
+﻿system,episodes,turns,probes,Current_Fact_Acc,Current_Fact_n,History_Fact_Acc,History_Fact_n,Avg_Active_Chain_Tokens,Avg_Active_Chain_Tokens_rendered,Avg_Active_Chain_Size,Avg_Archived,overrides_events,capacity_compressions,Tool_Calls,Tool_Call_Parse_Rate,Tool_Call_Unparsable,Tool_Call_Success_Rate,Prompt_Tokens,Completion_Tokens,Wall_Time_s,Errors
+three_layer,5,200,78,0.8,40,0.9091,33,476.41,1502.78,5.2,74.4,17,123,138,1.0,0,0.9638,829627,57706,1275.3,0

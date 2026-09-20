@@ -1,0 +1,11 @@
+{
+  "three_layer": {
+    "current_fact|string|correct": 36,
+    "history_fact|llm|wrong": 4,
+    "history_fact|string|correct": 28,
+    "current_fact|llm|wrong": 3,
+    "memory_point|string|correct": 5,
+    "history_fact|llm|correct": 1,
+    "current_fact|llm|correct": 1
+  }
+}
