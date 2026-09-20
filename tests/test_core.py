@@ -631,6 +631,153 @@ class TestGatedManager(unittest.TestCase):
         self.assertEqual(len(manager.list_active_summaries()), 1)
 
 
+class TestHeuristicExtraction(unittest.TestCase):
+    """
+    Regression pin for three extraction bugs the fact ledger surfaced.
+
+    ``audit_check.py`` reported ``silent_loss_rate = 0.2`` on the synthetic set while
+    every storage invariant passed -- i.e. the facts were never extracted correctly
+    in the first place.  All three causes were in the offline backend's lexical
+    extraction, not in the parser or the store.
+    """
+
+    def test_english_article_does_not_eat_the_first_letter(self):
+        from memory3l.llm import _clean_fact_value
+
+        # 'a' had no word boundary, so "alpha" -> "lpha", "theatre" -> "atre".
+        self.assertEqual(_clean_fact_value("alpha"), "alpha")
+        self.assertEqual(_clean_fact_value("theatre"), "theatre")
+        self.assertEqual(_clean_fact_value("a cat"), "cat")
+
+    def test_slot_keeps_a_leading_superlative(self):
+        from memory3l.llm import clean_slot
+
+        # '最' was listed as slot noise, so "最喜欢的饮料" became "饮料" and stopped
+        # matching its own earlier announcements.
+        self.assertEqual(clean_slot("最喜欢的饮料"), "最喜欢的饮料")
+        self.assertEqual(clean_slot("我的会议时间"), "会议时间")
+
+    def test_locative_verb_does_not_split_a_slot(self):
+        from memory3l.llm import HeuristicLLM
+
+        # "在" is both a state verb and a common slot character; with a lazy slot the
+        # match was slot="所" + verb="在" + value="城市是上海".
+        facts = HeuristicLLM.extract_facts("你好，跟你说一下，我的所在城市是上海。")
+        self.assertEqual(len(facts), 1)
+        _span, slot, value = facts[0]
+        self.assertEqual(slot, "所在城市")
+        self.assertEqual(value, "上海")
+        # ...without losing the genuine locative form
+        facts = HeuristicLLM.extract_facts("我的车在车库。")
+        self.assertEqual([(s, v) for _sp, s, v in facts], [("车", "车库")])
+
+
+class TestFactLedgerAudit(unittest.TestCase):
+    """
+    The audit surface must be able to *fail*; a check that cannot fail proves
+    nothing.  Both halves are pinned here: a clean episode reports no violations,
+    and each deliberate break trips exactly the invariant that covers it.
+    """
+
+    @staticmethod
+    def _run(store=None, turns=20):
+        from memory3l.dataset import build_long_context_episodes
+
+        episode = build_long_context_episodes(
+            num_episodes=1, turns_per_episode=turns, seed=777, language="zh"
+        )[0]
+        store = store or InMemoryStore(recent_window_turns=4)
+        manager = MemoryManager(
+            store, HeuristicLLM(), episode_id="ep_audit",
+            active_chain_token_limit=400, reset_on_bind=True,
+        )
+        for user, reply in episode.dialogues:
+            manager.add_dialog_turn(user, reply)
+        gold = [
+            (attr, value)
+            for attr, entries in episode.facts.items()
+            for _turn, value in entries
+        ]
+        return manager, episode, gold
+
+    def test_clean_episode_passes_every_invariant_and_loses_nothing(self):
+        manager, _episode, gold = self._run()
+        report = manager.verify(gold_facts=gold)
+        self.assertTrue(report.ok, report.violations)
+        for name, result in report.invariants.items():
+            self.assertTrue(result["ok"], name)
+        self.assertEqual(report.gold["silent_loss_rate"], 0.0)
+        self.assertGreater(report.counters["ledger_facts"], 0)
+
+    def test_ledger_records_why_a_fact_left_the_working_set(self):
+        manager, _episode, _gold = self._run()
+        archived = [r for r in manager.fact_ledger.entries() if r.reason]
+        self.assertTrue(archived, "expected some facts to have been overridden")
+        record = archived[0]
+        self.assertEqual(record.reason, "overridden")
+        self.assertTrue(record.superseded_by)
+        explained = manager.explain_fact(record.fact_id)
+        self.assertEqual(explained["state"], "archived")
+        self.assertEqual(explained["superseded_by"], record.superseded_by)
+
+    def test_evidence_resolves_to_the_original_turn(self):
+        manager, _episode, _gold = self._run()
+        record = manager.fact_ledger.entries()[0]
+        evidence = manager.evidence(record.fact_id)
+        self.assertIsNotNone(evidence)
+        self.assertTrue(evidence["messages"])
+        self.assertIn(record.value, evidence["messages"][0]["user"])
+
+    def test_control_a_silent_removal_trips_conservation(self):
+        """A summary removed from the store without being archived is a silent loss."""
+        manager, _episode, gold = self._run()
+        active_ids = {s.summary_id for s in manager.list_active_summaries()}
+        victim = next(
+            (r for r in manager.fact_ledger.entries() if r.summary_id in active_ids), None
+        )
+        self.assertIsNotNone(victim)
+        manager.store.remove_active_summary(victim.summary_id, episode_id=manager.episode_id)
+        report = manager.verify(gold_facts=gold)
+        self.assertFalse(report.ok, "I1 should have fired")
+        self.assertFalse(report.invariants["I1_fact_conservation"]["ok"])
+        self.assertGreater(report.invariants["I1_fact_conservation"]["missing"], 0)
+
+    def test_control_b_dropped_read_fields_trip_top_level_reachability(self):
+        """
+        Reproduce the historical serializer bug: values are stored, but the read path
+        loses ``fact_keys``.  Every storage invariant still passes (nothing is
+        missing, evidence resolves) while the current values silently become
+        invisible to the prompt -- which is exactly the failure that invalidated the
+        real hybrid runs.
+        """
+        import copy
+
+        class StrippingStore:
+            def __init__(self, inner):
+                object.__setattr__(self, "_inner", inner)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def list_active_summaries(self, episode_id=None):
+                out = []
+                for summary in self._inner.list_active_summaries(episode_id):
+                    clone = copy.copy(summary)
+                    clone.fact_keys = []
+                    clone.index_id = ""
+                    out.append(clone)
+                return out
+
+        manager, _episode, gold = self._run(
+            store=StrippingStore(InMemoryStore(recent_window_turns=4))
+        )
+        report = manager.verify(gold_facts=gold)
+        self.assertFalse(report.invariants["I2_top_level_current_value_reachable"]["ok"])
+        self.assertTrue(report.invariants["I1_fact_conservation"]["ok"],
+                        "the summaries still exist -- only their fields were lost")
+        self.assertEqual(manager.render_current_values(), "")
+
+
 class TestLongMemEvalAdapter(unittest.TestCase):
     """
     The adapter decides what a "question" even is, so its truncation and filtering

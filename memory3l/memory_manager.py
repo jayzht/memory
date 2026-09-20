@@ -60,6 +60,7 @@ from .prompts import (
     summarizer_system_prompt,
     summarizer_user_prompt,
 )
+from .audit import AuditReport, FactLedger, verify_invariants
 from .gate import SummaryGate, extract_candidate_pairs
 from .store.base import BaseMemoryStore
 from .token_utils import estimate_tokens, extract_fact_keys, truncate_to_tokens
@@ -208,6 +209,10 @@ class MemoryManager:
         #: needs no external attribute list (see memory3l/gate.py).
         self._slot_lexicon: set = set()
         self._seen_values: set = set()
+        #: Append-only record of every fact ever extracted in this episode.  It is
+        #: the independent denominator that makes "nothing was silently lost"
+        #: checkable -- see memory3l/audit.py.
+        self.fact_ledger = FactLedger()
         # The manager is the authority on the window size: make sure the store
         # enforces exactly the same bound (they are configured independently).
         self.store.recent_window_turns = self.recent_window_turns
@@ -282,6 +287,7 @@ class MemoryManager:
         # resumed episode keeps the same notion of "known slot / seen value".
         self._slot_lexicon = set()
         self._seen_values = set()
+        self.fact_ledger = FactLedger(episode_id)
         for summary in self.store.list_active_summaries(episode_id):
             self._remember_fact_keys(summary.fact_keys or extract_fact_keys(summary.text))
         logger.debug(
@@ -739,6 +745,17 @@ class MemoryManager:
             )
             self.overrides += 1
             archived_ids.append(overridden_id)
+        # Ledger first: this is the independent record of what was ever extracted,
+        # including summaries that are about to be archived.
+        self.fact_ledger.record_summary(
+            new_summary.summary_id, new_summary.fact_keys,
+            seq=new_summary.seq, turn_index=record.turn_index,
+            evidence=new_summary.raw_ref_ids,
+        )
+        for overridden_id in archived_ids:
+            self.fact_ledger.mark_left_working_set(
+                overridden_id, "overridden", superseded_by=new_summary.summary_id
+            )
         # An index is a pointer: keep it consistent with the chain it points into.
         if archived_ids:
             self._detach_from_indexes(archived_ids, stats)
@@ -1433,6 +1450,15 @@ class MemoryManager:
                 episode_id=self.episode_id,
             )
         self.store.add_active_summary(merged, episode_id=self.episode_id)
+        # A merged summary is created outside _apply_generated, so it needs its own
+        # ledger entry -- otherwise the facts it carries would look like they
+        # appeared from nowhere, and the absorbed ones would look unexplained.
+        self.fact_ledger.record_summary(
+            merged.summary_id, merged.fact_keys, seq=merged.seq,
+            turn_index=stats.turn_index, evidence=merged.raw_ref_ids,
+        )
+        for summary in batch:
+            self.fact_ledger.mark_left_working_set(summary.summary_id, "capacity")
         # The merged-away summaries may have been filed under a title; drop them
         # there too, or the index keeps advertising facts that are no longer in it.
         self._detach_from_indexes([s.summary_id for s in batch], stats)
@@ -1548,6 +1574,80 @@ class MemoryManager:
     # ------------------------------------------------------------------ #
     # reporting
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # audit surface (see memory3l/audit.py)
+    # ------------------------------------------------------------------ #
+    def verify(self, gold_facts: Optional[Sequence[tuple]] = None) -> AuditReport:
+        """
+        Cross-check the fact ledger against the store and report violations.
+
+        ``gold_facts`` (``[(slot, value), ...]``) is optional and only available in
+        evaluation settings where the ground truth is known; when given, the report
+        gains a ``silent_loss_rate`` -- the fraction of known facts that are neither
+        in the ledger nor resolvable.
+        """
+        reasons: Dict[str, int] = {}
+        for record in self.fact_ledger.entries():
+            if record.reason:
+                key = f"facts_left_{record.reason}"
+                reasons[key] = reasons.get(key, 0) + 1
+        index_titles = "\n".join(entry.title for entry in self.list_index_entries())
+        return verify_invariants(
+            self.episode_id,
+            self.fact_ledger,
+            active_summaries=self.list_active_summaries(),
+            archived_summaries=self.list_archived_summaries(),
+            rendered_text="\n".join(s.text for s in self.chain_summaries()),
+            top_level_text="\n".join([self.render_current_values(), index_titles]),
+            raw_lookup=self.get_raw_record,
+            reason_counts=reasons,
+            gold_facts=gold_facts,
+        )
+
+    def explain_fact(self, fact_id: str) -> Dict[str, Any]:
+        """Why is this fact not in the working set any more, and who replaced it?"""
+        record = self.fact_ledger.get(fact_id)
+        if record is None:
+            return {"fact_id": fact_id, "found": False}
+        active = self.store.get_active_summary(record.summary_id, episode_id=self.episode_id)
+        archived = self.store.get_archived_summary(record.summary_id, episode_id=None)
+        if active is not None:
+            state = "live"
+        elif archived is not None:
+            state = "archived"
+        else:
+            state = "MISSING"
+        return {
+            "fact_id": fact_id,
+            "found": True,
+            "slot": record.slot,
+            "value": record.value,
+            "observed_turn": record.observed_turn,
+            "state": state,
+            "reason": record.reason,
+            "superseded_by": record.superseded_by,
+            "evidence": list(record.evidence),
+        }
+
+    def evidence(self, fact_id: str) -> Optional[Dict[str, Any]]:
+        """The original dialogue a fact was extracted from (exact-id lookup)."""
+        record = self.fact_ledger.get(fact_id)
+        if record is None or not record.evidence:
+            return None
+        raws = [self.get_raw_record(ref) for ref in record.evidence]
+        raws = [item for item in raws if item is not None]
+        return {
+            "fact_id": fact_id,
+            "slot": record.slot,
+            "value": record.value,
+            "raw_refs": list(record.evidence),
+            "turns": [item.turn_index for item in raws],
+            "messages": [
+                {"turn": item.turn_index, "user": item.user_msg, "agent": item.agent_msg}
+                for item in raws
+            ],
+        }
+
     def episode_metrics(self) -> Dict[str, Any]:
         """Per-episode aggregates for the summary CSV."""
         chain = self.list_active_summaries()
@@ -1576,6 +1676,7 @@ class MemoryManager:
             "chain_strategy": self.chain_strategy,
             "capacity_merges_rejected": self.capacity_merges_rejected,
             "summarizer_failures": self.summarizer_failures,
+            **self.fact_ledger.stats(),
             "turns_summarised": sum(1 for s in self.stats if not s.summariser_skipped),
             "turns_not_summarised": sum(1 for s in self.stats if s.summariser_skipped),
             **self.summary_gate.stats(),

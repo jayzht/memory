@@ -408,7 +408,11 @@ _FACT_PATTERNS = [
     ),
     # (zh) "我的X是Y" / "我的X在Y" / "我的X改成了Y"
     re.compile(
-        r"我的([\u4e00-\u9fffA-Za-z0-9 _-]{1,20}?)(?:是|为|在|变成了|改成了|改成|改到|调到了|调到|现在是|已经变成)"
+        # Greedy slot, not lazy.  The verb alternation contains "在", which is also a
+        # common slot character: lazily, "我的所在城市是上海" split as slot="所" +
+        # verb="在" + value="城市是上海".  Greedy takes the longest slot that still
+        # leaves a verb, i.e. "所在城市" + "是" + "上海".
+        r"我的([\u4e00-\u9fffA-Za-z0-9 _-]{1,20})(?:是|为|在|变成了|改成了|改成|改到|调到了|调到|现在是|已经变成)"
         r"([^。；，\n]{1,40})"
     ),
     # (en) "I like / I prefer X"
@@ -432,7 +436,11 @@ _HISTORY_MARKERS_ZH = ("原来", "以前", "之前", "原本", "早先", "当初
 
 # Leading function words stripped from extracted fact values.
 _VALUE_LEADING = re.compile(
-    r"^(?:在|是|为|到|了|is|are|was|were|the|a|an)\s*", re.IGNORECASE
+    # The English articles need a word boundary: without it "alpha" -> "lpha" and
+    # "theatre" -> "atre", silently corrupting every extracted value that happened
+    # to start with a/an/the.  Found by the fact ledger: the recorded value did not
+    # match the gold value for exactly the values starting with "a".
+    r"^(?:在|是|为|到|了|(?:is|are|was|were|the|a|an)\b)\s*", re.IGNORECASE
 )
 _VALUE_TRAILING = re.compile(r"(?:了|呢|吗|的|now|please|ok|okay)[。.!！?？]*$", re.IGNORECASE)
 
@@ -467,7 +475,11 @@ def clean_slot(raw: str) -> str:
         previous = slot
         slot = _SLOT_NOISE.sub(" ", slot)
         slot = re.sub(r"[\s\-–—_]+", " ", slot).strip()
-        slot = re.sub(r"^(?:my|the|your|我|我的|最)\s*", "", slot).strip()
+        # Longest alternative first ("我的" before "我"), and no bare "最": that
+        # stripped the first character of any slot starting with it, so
+        # "最喜欢的饮料" (favourite drink) became "饮料" (drink) and stopped matching
+        # its own earlier announcements.
+        slot = re.sub(r"^(?:my|the|your|我的|我)\s*", "", slot).strip()
         slot = re.sub(r"^(?:喜欢|爱|讨厌)(?:的)?\s*", "", slot).strip()
         slot = re.sub(
             r"(?:是什么|是多少|是几|在哪儿|在哪里|在哪|在什么|叫啥|叫什么|多少钱|呢|吗)"
