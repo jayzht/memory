@@ -6,6 +6,7 @@ Runs offline (no network, no API cost) on the synthetic long set, where every fa
 change is annotated, so the audit report can carry a real ``silent_loss_rate``.
 
     python3 audit_check.py --episodes 3 --turns 40
+    python3 audit_check.py --aggregate --episodes 6          # batch-wide summary
 
 Two things are reported:
 
@@ -102,6 +103,8 @@ def main() -> int:
     parser.add_argument("--turns", type=int, default=40)
     parser.add_argument("--seed", type=int, default=777)
     parser.add_argument("--language", default="zh", choices=["zh", "en"])
+    parser.add_argument("--aggregate", action="store_true",
+                        help="also audit the whole batch at once and print the aggregate")
     args = parser.parse_args()
 
     episodes = build_long_context_episodes(
@@ -135,6 +138,30 @@ def main() -> int:
     print(f"汇总: gold 事实 {total_gold} | 已捕获且可解析 {total_found} | "
           f"silent_loss_rate = {rate:.4f}" if rate is not None else "汇总: 无 gold")
     print(f"      违规数 = {violations}")
+
+    if args.aggregate:
+        print()
+        print("=" * 78)
+        print("1b) 批量聚合审计（audit_all：单个 episode 的违规在均值里是看不见的）")
+        print("=" * 78)
+        from memory3l.audit import audit_all
+
+        shared = InMemoryStore(recent_window_turns=4)
+        episode_ids = []
+        for episode in episodes:
+            manager = MemoryManager(
+                shared, HeuristicLLM(), episode_id=episode.episode_id,
+                active_chain_token_limit=400, reset_on_bind=True,
+            )
+            for user, reply in episode.dialogues:
+                manager.add_dialog_turn(user, reply)
+            episode_ids.append(episode.episode_id)
+        aggregate = audit_all(shared, episode_ids)
+        print(f"  episodes={aggregate['episodes']} clean={aggregate['clean_episodes']} "
+              f"with_violations={aggregate['episodes_with_violations']}")
+        print(f"  invariant_failures = {aggregate['invariant_failures']}")
+        print(f"  violation_counts   = {aggregate['violation_counts']}")
+        print(f"  totals             = {aggregate['totals']}")
 
     # ---------------------------------------------------------------- #
     # 2) controls: the audit must be able to fail

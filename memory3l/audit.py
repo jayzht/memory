@@ -44,7 +44,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 from .gate import CHANGE, classify, extract_candidate_pairs
 
 __all__ = ["FactRecord", "FactLedger", "AuditReport", "verify_invariants",
-           "extraction_report", "normalise_fact"]
+           "extraction_report", "normalise_fact", "audit_all", "audit_episode"]
 
 
 @dataclass
@@ -550,6 +550,61 @@ def extraction_report(
         "all_captured": loose_captured,
         "all_recall": round(loose_captured / loose_total, 4) if loose_total else None,
         "gaps": gaps,
+    }
+
+
+def audit_all(store, episode_ids: Optional[Sequence[str]] = None, **kwargs) -> Dict[str, Any]:
+    """
+    Audit many episodes and aggregate -- what a batch run needs at the end.
+
+    Per-episode reports answer "is this one episode sound"; a batch needs the shape
+    of the whole run: how many episodes are clean, which invariant is disappointing
+    across the corpus, and how much erasure residue is outstanding.  A single
+    violation in one of five hundred episodes is invisible in a mean.
+    """
+    if episode_ids is None:
+        lister = getattr(store, "list_ledger_episodes", None)
+        episode_ids = lister() if callable(lister) else []
+
+    reports: List[AuditReport] = []
+    for episode_id in episode_ids:
+        reports.append(audit_episode(store, episode_id, **kwargs))
+
+    violation_counts: Dict[str, int] = {}
+    invariant_failures: Dict[str, int] = {}
+    for report in reports:
+        for violation in report.violations:
+            key = violation.split(":", 1)[0]
+            violation_counts[key] = violation_counts.get(key, 0) + 1
+        for name, result in report.invariants.items():
+            if not result.get("ok", True):
+                invariant_failures[name] = invariant_failures.get(name, 0) + 1
+
+    def _total(key: str, source: str = "invariants") -> int:
+        total = 0
+        for report in reports:
+            if source == "counters":
+                total += int(report.counters.get(key, 0) or 0)
+            else:
+                for result in report.invariants.values():
+                    total += int(result.get(key, 0) or 0)
+        return total
+
+    return {
+        "episodes": len(reports),
+        "clean_episodes": sum(1 for r in reports if r.ok),
+        "episodes_with_violations": sum(1 for r in reports if not r.ok),
+        "violation_counts": violation_counts,
+        "invariant_failures": invariant_failures,
+        "totals": {
+            "ledger_facts": _total("ledger_facts", "counters"),
+            "erased_facts": _total("erased_facts"),
+            "residual_prose_mentions": _total("residual_prose_mentions"),
+            "unreachable_current_values": _total("unreachable"),
+            "extraction_gaps": sum(len(r.invariants.get("I4_extraction_completeness", {}).get("gaps") or [])
+                                   for r in reports),
+        },
+        "reports": [r.to_dict() for r in reports],
     }
 
 

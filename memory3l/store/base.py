@@ -339,6 +339,11 @@ class BaseMemoryStore(abc.ABC):
     def count_fact_ledger(self, episode_id: Optional[str] = None) -> int:
         return len(self.list_fact_ledger(episode_id))
 
+    def list_ledger_episodes(self) -> List[str]:
+        """Episodes with an audit ledger -- what a batch-wide audit iterates."""
+        table = getattr(self, "_ledger_rows", None) or {}
+        return sorted({episode for (episode, _fact) in table if episode})
+
     def clear_archive(self, episode_id: str) -> int:
         """
         Delete one episode's archived summaries, returning how many were removed.

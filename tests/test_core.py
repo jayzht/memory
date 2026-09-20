@@ -1296,6 +1296,59 @@ class TestAuditSidecar(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertTrue(payload["consistent"], payload["anomalies"])
             self.assertGreater(payload["rows"], 0)
+
+            status, payload = get("/audit/summary")
+            self.assertEqual(status, 200)
+            self.assertGreaterEqual(payload["episodes"], 1)
+            self.assertIn("totals", payload)
+
+            # --- POST /facts: idempotent, and verified before answering ---------- #
+            summary_id = victim.summary_id
+
+            def post(body, path=f"/facts?episode={urllib.parse.quote(episode_id, safe='')}"):
+                url = f"http://127.0.0.1:{port}{path}&token=tok"
+                request = urllib.request.Request(
+                    url, data=_json.dumps(body).encode(), method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        return response.status, _json.loads(response.read().decode())
+                except urllib.error.HTTPError as exc:
+                    return exc.code, _json.loads(exc.read().decode())
+
+            batch = {"facts": [
+                {"slot": "新槽位", "value": "新值", "summary_id": summary_id,
+                 "observed_turn": 1, "evidence": ["e/raw0@x"]},
+            ]}
+            status, payload = post(batch)
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["added"], 1)
+            # The injected fact is accepted, then *reported*: the audit runs before the
+            # response, and it is right that an unbacked fact shows up (I1 for the
+            # dangling evidence, I2 because nothing renders its value).
+            self.assertFalse(payload["audit_ok"])
+            self.assertTrue(
+                any(v.startswith(("I1:", "I2:", "I3:")) for v in payload["violations"]),
+                payload["violations"],
+            )
+            status, payload = post(batch)          # retry the same batch
+            self.assertEqual(payload["added"], 0, "the intake must be idempotent")
+            self.assertEqual(payload["duplicates"], 1)
+
+            # a fact pointing at a summary that does not exist is reported, not hidden
+            status, payload = post({"facts": [
+                {"slot": "坏槽位", "value": "值", "summary_id": "no/such@summary",
+                 "observed_turn": 2},
+            ]})
+            self.assertEqual(status, 200)
+            self.assertTrue(any(v.startswith("I1:") for v in payload["violations"]),
+                            payload["violations"])
+
+            status, payload = post({"facts": []}, path="/audit?episode=x")
+            self.assertEqual(status, 405)
+            status, payload = post({"nope": 1})
+            self.assertEqual(status, 400)
         finally:
             httpd.shutdown()
             httpd.server_close()          # release the listening socket
