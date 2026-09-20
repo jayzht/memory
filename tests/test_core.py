@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -776,6 +777,181 @@ class TestFactLedgerAudit(unittest.TestCase):
         self.assertTrue(report.invariants["I1_fact_conservation"]["ok"],
                         "the summaries still exist -- only their fields were lost")
         self.assertEqual(manager.render_current_values(), "")
+
+
+class TestLedgerPersistence(unittest.TestCase):
+    """
+    The ledger must outlive the process that wrote it.
+
+    An audit record that vanishes on restart is not an audit record, so this pins the
+    round trip: write with one store, drop it, and re-derive the *same* report from a
+    fresh store that has only the SQLite file (the hot cache deliberately empty).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "ledger.db")
+
+    @staticmethod
+    def _hybrid(path):
+        from memory3l.store.hybrid_store import RedisSQLiteHybridStore
+        from memory3l.store.redis_store import RedisHotStore
+        from memory3l.store.sqlite_store import SQLiteColdStore
+        from test_store import FakeRedis    # shared in-process stand-in
+        # FakeRedis: the sidecar path must not depend on a real Redis at all.
+        fake = FakeRedis()
+        hot = RedisHotStore(key_prefix="episode:{episode_id}", client=fake)
+        return RedisSQLiteHybridStore(redis_store=hot, sqlite_store=SQLiteColdStore(path))
+
+    def test_restart_reproduces_the_same_audit(self):
+        from memory3l.audit import FactLedger, audit_episode
+        from memory3l.dataset import build_long_context_episodes
+
+        episode = build_long_context_episodes(
+            num_episodes=1, turns_per_episode=16, seed=777, language="zh"
+        )[0]
+        gold = [
+            (attr, value) for attr, entries in episode.facts.items()
+            for _turn, value in entries
+        ]
+        episode_id = "three_layer/long_0000"
+
+        store = self._hybrid(self.db)
+        manager = MemoryManager(
+            store, HeuristicLLM(), episode_id=episode_id,
+            active_chain_token_limit=400, reset_on_bind=True,
+        )
+        for user, reply in episode.dialogues:
+            manager.add_dialog_turn(user, reply)
+        live = manager.verify(gold_facts=gold)
+        fact_id = manager.fact_ledger.entries()[0].fact_id
+        self.assertGreater(live.counters["ledger_facts"], 0)
+        del manager, store                      # the writing process is gone
+
+        reopened = self._hybrid(self.db)
+        after = audit_episode(reopened, episode_id, gold_facts=gold)
+        self.assertEqual(live.invariants, after.invariants)
+        self.assertEqual(live.gold, after.gold)
+        self.assertEqual(live.counters["ledger_facts"], after.counters["ledger_facts"])
+
+        # ...and the ledger is queryable, which is the whole point of the sidecar
+        ledger = FactLedger(episode_id, store=reopened)
+        record = ledger.get(fact_id)
+        self.assertIsNotNone(record, "the ledger did not survive the restart")
+        self.assertTrue(reopened.get_raw_record(record.evidence[0], episode_id=episode_id))
+
+    def test_a_fresh_episode_does_not_inherit_the_previous_ledger(self):
+        """The namespace has no run id, so a fresh start must clear the audit record."""
+        from memory3l.dataset import build_long_context_episodes
+
+        episode = build_long_context_episodes(
+            num_episodes=1, turns_per_episode=12, seed=777, language="zh"
+        )[0]
+        episode_id = "three_layer/long_0000"
+        store = self._hybrid(self.db)
+        first = MemoryManager(store, HeuristicLLM(), episode_id=episode_id,
+                              active_chain_token_limit=400, reset_on_bind=True)
+        for user, reply in episode.dialogues:
+            first.add_dialog_turn(user, reply)
+        self.assertGreater(first.fact_ledger.stats()["ledger_facts"], 0)
+
+        # reset_on_bind=True == a fresh run over the same (run-agnostic) namespace
+        second = MemoryManager(store, HeuristicLLM(), episode_id=episode_id,
+                               active_chain_token_limit=400, reset_on_bind=True)
+        self.assertEqual(second.fact_ledger.stats()["ledger_facts"], 0)
+
+
+class TestAuditSidecar(unittest.TestCase):
+    """The sidecar answers from the persisted store alone, and gates access."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "sidecar.db")
+
+    def _seed(self):
+        from memory3l.store.hybrid_store import RedisSQLiteHybridStore
+        from memory3l.store.redis_store import RedisHotStore
+        from memory3l.store.sqlite_store import SQLiteColdStore
+        from memory3l.dataset import build_long_context_episodes
+        from test_store import FakeRedis
+
+        episode = build_long_context_episodes(
+            num_episodes=1, turns_per_episode=16, seed=777, language="zh"
+        )[0]
+        episode_id = "three_layer/long_0000"
+        store = RedisSQLiteHybridStore(
+            redis_store=RedisHotStore(key_prefix="episode:{episode_id}", client=FakeRedis()),
+            sqlite_store=SQLiteColdStore(self.db),
+        )
+        manager = MemoryManager(store, HeuristicLLM(), episode_id=episode_id,
+                                active_chain_token_limit=400, reset_on_bind=True)
+        for user, reply in episode.dialogues:
+            manager.add_dialog_turn(user, reply)
+        fact_id = manager.fact_ledger.entries()[0].fact_id
+        return episode_id, fact_id
+
+    def test_service_reads_only_from_sqlite(self):
+        from audit_server import AuditService
+
+        episode_id, fact_id = self._seed()
+        service = AuditService(self.db, token="t")
+        self.assertEqual(service.episodes(), [episode_id])
+
+        report = service.audit(episode_id)
+        self.assertTrue(report["ok"], report["violations"])
+        self.assertTrue(all(v["ok"] for v in report["invariants"].values()))
+
+        current = service.current(episode_id)
+        self.assertIn("=", current["registry"])
+
+        fact = service.fact(fact_id)
+        self.assertEqual(fact["slot"], fact_id.split("#", 1)[1])
+        self.assertIn(fact["state"], ("live", "archived"))
+
+        evidence = service.evidence(fact_id)
+        self.assertTrue(evidence["resolved"])
+        self.assertTrue(evidence["messages"][0]["user"])
+        self.assertIsNone(service.fact("nope#nope"))
+        service.close()
+
+    def test_http_endpoints_and_access_control(self):
+        import json as _json
+        import threading
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        from audit_server import build_server
+
+        episode_id, fact_id = self._seed()
+        httpd = build_server("127.0.0.1", 0, self.db, "tok")
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            def get(path, token="tok"):
+                url = f"http://127.0.0.1:{port}{path}"
+                if token is not None:
+                    url += ("&" if "?" in path else "?") + f"token={token}"
+                try:
+                    with urllib.request.urlopen(url, timeout=5) as response:
+                        return response.status, _json.loads(response.read().decode())
+                except urllib.error.HTTPError as exc:
+                    return exc.code, _json.loads(exc.read().decode())
+
+            status, payload = get(f"/audit?episode={urllib.parse.quote(episode_id, safe='')}")
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["ok"])
+            # a fact id contains "#", so it must travel in the query string
+            status, payload = get(f"/fact?fact_id={urllib.parse.quote(fact_id, safe='')}")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["value"], fact_id.split("#", 1)[1] and payload["value"])
+            self.assertEqual(get(f"/audit?episode={episode_id}", token=None)[0], 403)
+            self.assertEqual(get("/fact?fact_id=nope")[0], 404)
+            self.assertEqual(get("/fact")[0], 400)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()          # release the listening socket
+            httpd.audit_service.close()
 
 
 class TestLongMemEvalAdapter(unittest.TestCase):

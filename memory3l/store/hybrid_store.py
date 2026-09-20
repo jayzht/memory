@@ -126,6 +126,25 @@ class RedisSQLiteHybridStore(BaseMemoryStore):
         """Drop this episode's archived summaries; raw records are permanent."""
         return self.cold.clear_archive(self._ep(episode_id))
 
+    # The ledger lives in SQLite only: it is an audit record, not hot state, and it
+    # must survive Redis being lost.
+    def append_fact_ledger(self, rows) -> int:
+        return self.cold.append_fact_ledger(rows)
+
+    def list_fact_ledger(self, episode_id=None):
+        return self.cold.list_fact_ledger(self._ep(episode_id))
+
+    def update_fact_ledger_reason(self, summary_id, reason, superseded_by="", episode_id=None) -> int:
+        return self.cold.update_fact_ledger_reason(
+            summary_id, reason, superseded_by, episode_id=self._ep(episode_id)
+        )
+
+    def clear_fact_ledger(self, episode_id) -> int:
+        return self.cold.clear_fact_ledger(self._ep(episode_id))
+
+    def count_fact_ledger(self, episode_id=None) -> int:
+        return self.cold.count_fact_ledger(self._ep(episode_id))
+
     def rebuild_hot_state(self, episode_id: Optional[str] = None) -> bool:
         """Restore active chain + window into Redis from the SQLite mirrors."""
         episode = self._ep(episode_id)

@@ -53,6 +53,7 @@ class FactRecord:
     slot: str
     value: str
     seq: int                         # creation order inside the episode
+    episode_id: str = ""
     observed_turn: int = -1
     evidence: List[str] = field(default_factory=list)   # raw_ref_ids
     #: Why the carrying summary left the working set: "" (still live),
@@ -66,6 +67,39 @@ class FactRecord:
     def render(self) -> str:
         state = "live" if not self.reason else self.reason
         return f"{self.slot}={self.value} [{state}] via {self.summary_id}"
+
+    # --- persistence: the store layer speaks plain dicts, so it never has to
+    # --- import these dataclasses (keeps the dependency direction one-way)
+    def to_row(self) -> Dict[str, Any]:
+        return {
+            "fact_id": self.fact_id,
+            "episode_id": self.episode_id,
+            "summary_id": self.summary_id,
+            "slot": self.slot,
+            "value": self.value,
+            "seq": int(self.seq),
+            "observed_turn": int(self.observed_turn),
+            # packed with "|" like every other id list in the store schemas
+            "evidence": "|".join(self.evidence),
+            "reason": self.reason,
+            "superseded_by": self.superseded_by,
+        }
+
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> "FactRecord":
+        evidence = row.get("evidence") or ""
+        return cls(
+            fact_id=row["fact_id"],
+            summary_id=row.get("summary_id", ""),
+            episode_id=row.get("episode_id", ""),
+            slot=row.get("slot", ""),
+            value=row.get("value", ""),
+            seq=int(row.get("seq", -1) or -1),
+            observed_turn=int(row.get("observed_turn", -1) or -1),
+            evidence=[ref for ref in str(evidence).split("|") if ref],
+            reason=row.get("reason", "") or "",
+            superseded_by=row.get("superseded_by", "") or "",
+        )
 
 
 @dataclass
@@ -126,11 +160,36 @@ class FactLedger:
     record that a disappearance can be detected *against*.
     """
 
-    def __init__(self, episode_id: str = ""):
+    def __init__(self, episode_id: str = "", store=None):
         self.episode_id = episode_id
+        #: Optional durable backing.  When given, every append/update is written
+        #: through, and construction reloads whatever is already there -- an audit
+        #: ledger that vanishes on restart is not an audit ledger.
+        self.store = store
         self._records: List[FactRecord] = []
         self._by_id: Dict[str, FactRecord] = {}
         self.duplicate_observations = 0
+        if store is not None:
+            self.reload()
+
+    # ------------------------------------------------------------------ #
+    # durability
+    # ------------------------------------------------------------------ #
+    def reload(self) -> int:
+        """Load this episode's ledger from the store (no-op without one)."""
+        if self.store is None or not self.episode_id:
+            return 0
+        try:
+            rows = self.store.list_fact_ledger(self.episode_id)
+        except (AttributeError, NotImplementedError):
+            return 0
+        self._records = []
+        self._by_id = {}
+        for row in rows:
+            record = FactRecord.from_row(row)
+            self._records.append(record)
+            self._by_id[record.fact_id] = record
+        return len(self._records)
 
     # ------------------------------------------------------------------ #
     # writing (called by MemoryManager at the moment a summary is created)
@@ -151,13 +210,19 @@ class FactLedger:
                 self.duplicate_observations += 1
                 continue
             record = FactRecord(
-                fact_id=fact_id, summary_id=summary_id, slot=slot, value=value,
+                fact_id=fact_id, summary_id=summary_id, episode_id=self.episode_id,
+                slot=slot, value=value,
                 seq=seq, observed_turn=turn_index,
                 evidence=[ref for ref in evidence if ref],
             )
             self._records.append(record)
             self._by_id[fact_id] = record
             created.append(record)
+        if created and self.store is not None:
+            try:
+                self.store.append_fact_ledger([r.to_row() for r in created])
+            except (AttributeError, NotImplementedError):
+                pass          # a store without durability still audits in-process
         return created
 
     def mark_left_working_set(self, summary_id: str, reason: str, superseded_by: str = "") -> int:
@@ -168,6 +233,13 @@ class FactLedger:
                 record.reason = reason
                 record.superseded_by = superseded_by
                 touched += 1
+        if touched and self.store is not None:
+            try:
+                self.store.update_fact_ledger_reason(
+                    summary_id, reason, superseded_by, episode_id=self.episode_id
+                )
+            except (AttributeError, NotImplementedError):
+                pass
         return touched
 
     # ------------------------------------------------------------------ #
@@ -196,6 +268,81 @@ class FactLedger:
             "ledger_archived": sum(1 for r in self._records if r.reason),
             "ledger_duplicate_observations": self.duplicate_observations,
         }
+
+
+def derive_current_values(summaries, max_slots: int = 12) -> List[tuple]:
+    """
+    ``[(slot, value, summary_id)]`` -- newest live summary per slot.
+
+    Shared by the manager (which renders it into the prompt) and the audit (which
+    checks that the prompt shows every current value), so the audit can only ever
+    inspect exactly what the model is shown.
+    """
+    latest: Dict[str, tuple] = {}
+    for summary in summaries:                      # oldest -> newest
+        keys = getattr(summary, "fact_keys", None) or []
+        for key in keys:
+            if "=" not in key:
+                continue
+            slot, _, value = key.partition("=")
+            slot, value = slot.strip().lower(), value.strip()
+            if slot and value:
+                latest[slot] = (slot, value, summary.summary_id, summary.seq)
+    if not latest:
+        return []
+    ordered = sorted(latest.values(), key=lambda item: item[3], reverse=True)[: max(1, max_slots)]
+    ordered.sort(key=lambda item: item[3])
+    return [(slot, value, summary_id) for slot, value, summary_id, _ in ordered]
+
+
+def render_current_values(summaries, max_slots: int = 12) -> str:
+    items = derive_current_values(summaries, max_slots)
+    if not items:
+        return ""
+    return "; ".join(f"{slot}={value}" for slot, value, _ in items)
+
+
+def audit_episode(store, episode_id: str, gold_facts=None, max_slots: int = 12) -> AuditReport:
+    """
+    Audit a **persisted** episode without a live manager.
+
+    This is what a sidecar service needs: the agent process may be long gone, and
+    all that is left is the store.  The top-level view is reconstructed with the
+    same rules the prompt uses (registry -> rendered chain -> live index titles), so
+    a violation here means the *persisted* state would not have shown the value
+    either.
+    """
+    from .models import LAZY_INDEX_ID
+
+    active = store.list_active_summaries(episode_id)
+    archived = store.list_archived_summaries(episode_id)
+    entries = store.list_index_entries(episode_id)
+
+    title_members = set()
+    for entry in entries:
+        title_members.update(entry.members)
+    chain = [
+        s for s in active
+        if s.summary_id not in title_members and s.index_id != LAZY_INDEX_ID
+    ]
+
+    ledger = FactLedger(episode_id, store=store)
+    def _raw_lookup(reference_id: str):
+        return store.get_raw_record(reference_id, episode_id=episode_id)
+
+    return verify_invariants(
+        episode_id,
+        ledger,
+        active_summaries=active,
+        archived_summaries=archived,
+        rendered_text="\n".join(s.text for s in chain),
+        top_level_text="\n".join(
+            [render_current_values(active, max_slots),
+             "\n".join(entry.title for entry in entries)]
+        ),
+        raw_lookup=_raw_lookup,
+        gold_facts=gold_facts,
+    )
 
 
 def verify_invariants(

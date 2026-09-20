@@ -95,6 +95,20 @@ CREATE TABLE IF NOT EXISTS index_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_index_episode ON index_entries(episode_id, seq);
 
+CREATE TABLE IF NOT EXISTS fact_ledger (
+    fact_id       TEXT PRIMARY KEY,
+    episode_id    TEXT NOT NULL DEFAULT '',
+    summary_id    TEXT NOT NULL DEFAULT '',
+    slot          TEXT NOT NULL DEFAULT '',
+    value         TEXT NOT NULL DEFAULT '',
+    seq           INTEGER NOT NULL DEFAULT -1,
+    observed_turn INTEGER NOT NULL DEFAULT -1,
+    evidence      TEXT NOT NULL DEFAULT '',
+    reason        TEXT NOT NULL DEFAULT '',
+    superseded_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_episode ON fact_ledger(episode_id, seq);
+
 CREATE TABLE IF NOT EXISTS sliding_window (
     episode_id   TEXT NOT NULL,
     position     INTEGER NOT NULL,
@@ -248,9 +262,25 @@ class SQLiteColdStore:
             meta=meta,
         )
 
-    def get_raw_record(self, reference_id: str) -> Optional[RawDialogRecord]:
+    def get_raw_record(
+        self, reference_id: str, episode_id: Optional[str] = None
+    ) -> Optional[RawDialogRecord]:
+        """
+        Exact-id lookup.
+
+        Accepts ``episode_id`` to match the :class:`BaseMemoryStore` contract: raw
+        ids already embed the episode, so the parameter is a scope assertion, not a
+        filter.  Without it this cold store could not be used as a standalone memory
+        store (every caller passes ``episode_id=`` as a keyword), which is exactly
+        the kind of hot/cold asymmetry that keeps producing surprises.
+        """
         row = self.query_one("SELECT * FROM raw_records WHERE reference_id=?", (reference_id,))
-        return self._row_to_raw(row) if row else None
+        if row is None:
+            return None
+        record = self._row_to_raw(row)
+        if episode_id is not None and record.episode_id and record.episode_id != episode_id:
+            return None
+        return record
 
     def list_raw_records(self, episode_id: Optional[str] = None) -> List[RawDialogRecord]:
         if episode_id is None:
@@ -400,6 +430,42 @@ class SQLiteColdStore:
     def remove_active_summary(self, summary_id: str) -> None:
         self.execute("DELETE FROM active_summaries WHERE summary_id=?", (summary_id,))
 
+    # ------------------------------------------------------------------ #
+    # read-side conveniences from the BaseMemoryStore contract
+    # ------------------------------------------------------------------ #
+    # This class is not a BaseMemoryStore (it has no episode binding), but tools that
+    # only *read* -- an audit sidecar, a report generator -- need the same conveniences
+    # a memory store offers.  They were missing, so a cold store could not stand in
+    # for one; adding them here removes that asymmetry instead of working around it at
+    # every call site.
+    def get_active_summary(
+        self, summary_id: str, episode_id: Optional[str] = None
+    ) -> Optional[ActiveSummary]:
+        for summary in self.list_active_summaries(episode_id):
+            if summary.summary_id == summary_id:
+                return summary
+        return None
+
+    def get_raw_records(
+        self, reference_ids: Sequence[str], episode_id: Optional[str] = None
+    ) -> List[RawDialogRecord]:
+        out: List[RawDialogRecord] = []
+        for reference_id in reference_ids:
+            record = self.get_raw_record(reference_id, episode_id)
+            if record is not None:
+                out.append(record)
+        return out
+
+    def chain_summaries(self, episode_id: Optional[str] = None) -> List[ActiveSummary]:
+        """Summaries not filed under any index -- the same rule the prompt uses."""
+        title_members = set()
+        for entry in self.list_index_entries(episode_id):
+            title_members.update(entry.members)
+        return [
+            summary for summary in self.list_active_summaries(episode_id)
+            if summary.summary_id not in title_members
+        ]
+
     def list_active_summaries(self, episode_id: Optional[str] = None) -> List[ActiveSummary]:
         if episode_id is None:
             rows = self.query("SELECT * FROM active_summaries ORDER BY timestamp, seq")
@@ -524,6 +590,72 @@ class SQLiteColdStore:
     def clear_active_summaries(self, episode_id: str) -> None:
         self.execute("DELETE FROM active_summaries WHERE episode_id=?", (episode_id,))
         self.execute("DELETE FROM index_entries WHERE episode_id=?", (episode_id,))
+
+    # ------------------------------------------------------------------ #
+    # fact ledger (append-only audit record)
+    # ------------------------------------------------------------------ #
+    def append_fact_ledger(self, rows: Sequence[Dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        with self._lock:
+            cursor = self._conn.executemany(
+                """INSERT OR IGNORE INTO fact_ledger
+                       (fact_id, episode_id, summary_id, slot, value, seq,
+                        observed_turn, evidence, reason, superseded_by)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        row.get("fact_id", ""), row.get("episode_id", ""),
+                        row.get("summary_id", ""), row.get("slot", ""), row.get("value", ""),
+                        int(row.get("seq", -1) or -1), int(row.get("observed_turn", -1) or -1),
+                        row.get("evidence", ""), row.get("reason", ""),
+                        row.get("superseded_by", ""),
+                    )
+                    for row in rows
+                ],
+            )
+            self._conn.commit()
+            return int(cursor.rowcount or 0)
+
+    def list_fact_ledger(self, episode_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        if episode_id is None:
+            rows = self.query("SELECT * FROM fact_ledger ORDER BY seq, fact_id")
+        else:
+            rows = self.query(
+                "SELECT * FROM fact_ledger WHERE episode_id=? ORDER BY seq, fact_id",
+                (episode_id,),
+            )
+        return [dict(row) for row in rows]
+
+    def update_fact_ledger_reason(
+        self, summary_id: str, reason: str, superseded_by: str = "",
+        episode_id: Optional[str] = None,
+    ) -> int:
+        if episode_id is None:
+            cursor = self.execute(
+                "UPDATE fact_ledger SET reason=?, superseded_by=? "
+                "WHERE summary_id=? AND reason=''",
+                (reason, superseded_by, summary_id),
+            )
+        else:
+            cursor = self.execute(
+                "UPDATE fact_ledger SET reason=?, superseded_by=? "
+                "WHERE summary_id=? AND episode_id=? AND reason=''",
+                (reason, superseded_by, summary_id, episode_id),
+            )
+        return int(cursor.rowcount or 0)
+
+    def clear_fact_ledger(self, episode_id: str) -> int:
+        cursor = self.execute("DELETE FROM fact_ledger WHERE episode_id=?", (episode_id,))
+        return int(cursor.rowcount or 0)
+
+    def count_fact_ledger(self, episode_id: Optional[str] = None) -> int:
+        return len(self.list_fact_ledger(episode_id))
+
+    def list_ledger_episodes(self) -> List[str]:
+        """Episodes that have an audit ledger -- what a sidecar can serve."""
+        rows = self.query("SELECT DISTINCT episode_id FROM fact_ledger ORDER BY episode_id")
+        return [row["episode_id"] for row in rows if row["episode_id"]]
 
     def clear_archive(self, episode_id: str) -> int:
         """Drop this episode's archived summaries; raw records stay (permanent)."""

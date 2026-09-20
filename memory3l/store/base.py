@@ -253,6 +253,67 @@ class BaseMemoryStore(abc.ABC):
     def count_archived_summaries(self, episode_id: Optional[str] = None) -> int:
         return len(self.list_archived_summaries(episode_id))
 
+    # ------------------------------------------------------------------ #
+    # Layer 4: the fact ledger (append-only audit record)
+    # ------------------------------------------------------------------ #
+    # The ledger is the independent record that makes "nothing was silently lost"
+    # checkable: it logs every (slot, value) ever extracted, including summaries
+    # that are later overridden or merged away.  It is append-only by contract --
+    # the only mutation allowed is recording *why* a fact left the working set.
+    def append_fact_ledger(self, rows: Sequence[Dict[str, Any]]) -> int:
+        """
+        Append audit rows; an existing ``fact_id`` is ignored (append-only).
+
+        The default keeps rows in memory so any backend works; durable stores
+        override it.  An audit ledger that disappears on restart is not an audit
+        ledger, which is why SQLite implements this for real.
+        """
+        table = getattr(self, "_ledger_rows", None)
+        if table is None:
+            table = {}
+            self._ledger_rows = table
+        added = 0
+        for row in rows:
+            key = (row.get("episode_id", ""), row.get("fact_id", ""))
+            if key in table:
+                continue
+            table[key] = dict(row)
+            added += 1
+        return added
+
+    def list_fact_ledger(self, episode_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        table = getattr(self, "_ledger_rows", {}) or {}
+        rows = [
+            row for (episode, _fact), row in table.items()
+            if episode_id is None or episode == self._ep(episode_id)
+        ]
+        return sorted(rows, key=lambda row: (row.get("seq", -1), row.get("fact_id", "")))
+
+    def update_fact_ledger_reason(
+        self, summary_id: str, reason: str, superseded_by: str = "",
+        episode_id: Optional[str] = None,
+    ) -> int:
+        touched = 0
+        for row in self.list_fact_ledger(episode_id):
+            if row.get("summary_id") == summary_id and not row.get("reason"):
+                row["reason"] = reason
+                row["superseded_by"] = superseded_by
+                touched += 1
+        return touched
+
+    def clear_fact_ledger(self, episode_id: str) -> int:
+        table = getattr(self, "_ledger_rows", None)
+        if not table:
+            return 0
+        episode = self._ep(episode_id)
+        doomed = [key for key in table if key[0] == episode]
+        for key in doomed:
+            table.pop(key, None)
+        return len(doomed)
+
+    def count_fact_ledger(self, episode_id: Optional[str] = None) -> int:
+        return len(self.list_fact_ledger(episode_id))
+
     def clear_archive(self, episode_id: str) -> int:
         """
         Delete one episode's archived summaries, returning how many were removed.

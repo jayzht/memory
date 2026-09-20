@@ -1,4 +1,4 @@
-# 可审计记忆层组件（M1）
+# 可审计记忆层组件（M1 + M2）
 
 > 定位：**不做通用记忆系统，做一个能被验证的记忆层组件。**
 > 你不卖代码——`remember()`/`current()` 谁都能写；你卖的是**那套他们不会想到去写的检查**。
@@ -118,24 +118,75 @@ M1 的**第一次**运行就报出 `silent_loss_rate = 0.2`——三条存储不
 
 ---
 
-## 七、还没做（M2 候选，按价值排序）
+## 六点五、M2：台账落盘 + sidecar（已完成）
+
+### 台账落盘
+
+`fact_ledger` 成为 SQLite 的**第七张业务表**（append-only）：
+
+```sql
+CREATE TABLE fact_ledger (
+    fact_id TEXT PRIMARY KEY,          -- "<summary_id>#<slot>"
+    episode_id, summary_id, slot, value, seq, observed_turn,
+    evidence, reason, superseded_by
+);
+```
+
+* `INSERT OR IGNORE` —— 只追加，同一 `fact_id` 不覆盖；唯一允许的变更是**记录事实为何离开工作集**（`reason=overridden|capacity`）
+* 写路径：`_apply_generated` / 容量合并时同步落库；三套 store 都实现了（基类内存兜底、SQLite 真正持久化、hybrid 委托冷层）
+* **`reset_on_bind=True` 会清空该 episode 的台账**：命名空间不含 run id，否则会像归档那样跨 run 污染
+* `resume` 则**加载**已有台账，重启后仍能解释整段历史
+
+**验收**：写入 → 丢掉 store → 用全新 store（热缓存故意留空）重开 → 只靠 SQLite 审计，**不变式 / gold / 条数完全一致**，`explain` 与 `evidence` 仍可用。
+
+### sidecar（`audit_server.py`）
+
+只读 HTTP 服务，**不需要 Redis**（一切从 SQLite 推导），agent 进程退出后照样工作：
+
+| 端点 | 用途 |
+|---|---|
+| `GET /health` | 存活 + 用的是哪个 db |
+| `GET /episodes` | 有台账的 episode 列表 |
+| `GET /audit?episode=<id>` | AuditReport（I1/I2/I3 + counters） |
+| `GET /current?episode=<id>` | 顶层当前值 |
+| `GET /fact?fact_id=<id>` | 这个事实为什么离开工作集 |
+| `GET /fact/evidence?fact_id=<id>` | 它的原文出处 |
+
+```bash
+python3 audit_server.py --sqlite-path exp_lm.db --port 8020 --token mem2024
+```
+
+**两个真实的集成陷阱（都已处理）**：
+
+1. **`fact_id` 里含 `#`**（`<episode>/<kind><seq>@<hash>#<slot>`）——URL 里 `#` 之后会被当作 fragment 丢掉，客户端把 id 拼进路径就会**静默失去 slot**。所以规范形式是查询参数 `?fact_id=`，并且服务端对路径形式做**百分号解码**（两种都支持）。
+2. **冷存储接口不对称**：`SQLiteColdStore` 缺 `get_raw_record(episode_id=)`、`get_active_summary`、`chain_summaries`——所以纯冷存储**当不了记忆存储**（audit/sidecar 正是这种用法）。已补齐这三个，让冷存储能独立承担只读角色，而不是在每个调用点绕开。
+
+访问控制：默认绑定 `127.0.0.1` + `?token=`（`/fact/evidence` 会返回原始对话）；`POST` 一律 405（写入只发生在 agent 进程里）。
+
+---
+
+## 七、还没做（M3 候选，按价值排序）
 
 | # | 项 | 说明 |
 |---|---|---|
-| 1 | **台账持久化** | M1 的台账是**内存内、单 episode**。生产必须落盘（append-only 表），否则重启即失去审计能力。设计是 store-agnostic 的，加一个适配器即可 |
-| 2 | **sidecar HTTP 形态** | 审计员要的是**一个端点**，不是一个 Python 对象。`GET /audit`、`GET /fact/{id}/evidence` 是关键接口 |
-| 3 | **抽取完整性度量** | `silent_loss_rate` 需要一个 gold 来源；生产上没有 gold 时，需要"候选事实召回率"之类的替代口径 |
-| 4 | **合规删除** | 墓碑 + 按主体加密（删密钥），保留"变更史"但满足删除权 |
-| 5 | **时态存储适配器** | 把 `archive_reason`/`superseded_by` 映射到系统版本化表，验证"外包存储"这条路真的走得通 |
+| 1 | **抽取完整性度量** | `silent_loss_rate` 需要 gold；生产上没有 gold，需要"候选事实召回率"之类的替代口径。**这是目前最大的空缺**：I1–I3 覆盖了存储，抽取质量仍无运行时口径 |
+| 2 | **合规删除** | 墓碑 + 按主体加密（删密钥）：保住"变更史"又满足删除权。**不做这条就进不了欧盟/医疗** |
+| 3 | **时态存储适配器** | 把 `archive_reason`/`superseded_by` 映射到系统版本化表（Postgres/XTDB），验证"外包存储"真能落地 |
+| 4 | **写接口** | sidecar 目前只读；若要让别的进程写，需要一次带幂等键的 `remember` 调用 |
+| 5 | **多 episode 聚合审计** | 现在按 episode 审计；批量场景要一份"跨 episode 的违规汇总" |
 
 ---
 
 ## 八、复现
 
 ```bash
-python3 -m unittest discover -s tests          # 86 tests
-python3 audit_check.py --episodes 3 --turns 40 # 审计 + 两个对照
-python3 gate_sweep.py --episodes 3 --turns 40  # 摘要器门控前沿（另一条线）
+python3 -m unittest discover -s tests                      # 90 tests
+python3 audit_check.py --episodes 3 --turns 40             # 审计 + 两个对照
+python3 gate_sweep.py --episodes 3 --turns 40              # 摘要器门控前沿（另一条线）
+
+# sidecar：先跑一轮把台账写进 SQLite，再起只读服务
+python3 audit_server.py --sqlite-path exp_lm.db --port 8020 --token mem2024
+#   curl 'http://127.0.0.1:8020/audit?episode=three_layer%2Flong_0000&token=mem2024'
 ```
 
 | 文件 | 内容 |
@@ -143,4 +194,6 @@ python3 gate_sweep.py --episodes 3 --turns 40  # 摘要器门控前沿（另一�
 | `memory3l/audit.py` | `FactLedger` + `AuditReport` + 三条不变式的实现 |
 | `memory3l/memory_manager.py` | `verify()` / `explain_fact()` / `evidence()`；台账写入点 |
 | `audit_check.py` | 审计 + **两个必须失败的对照** |
+| `audit_server.py` | 只读 sidecar（无 Redis 依赖，agent 退出后仍可用） |
+| `memory3l/store/*` | `fact_ledger` 表 + 三套 store 的读写实现 |
 | `tests/test_core.py` | `TestFactLedgerAudit`（含两个对照）、`TestHeuristicExtraction`（三个 bug 的回归钉） |

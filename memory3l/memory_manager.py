@@ -60,7 +60,7 @@ from .prompts import (
     summarizer_system_prompt,
     summarizer_user_prompt,
 )
-from .audit import AuditReport, FactLedger, verify_invariants
+from .audit import AuditReport, FactLedger, derive_current_values, verify_invariants
 from .gate import SummaryGate, extract_candidate_pairs
 from .store.base import BaseMemoryStore
 from .token_utils import estimate_tokens, extract_fact_keys, truncate_to_tokens
@@ -212,11 +212,14 @@ class MemoryManager:
         #: Append-only record of every fact ever extracted in this episode.  It is
         #: the independent denominator that makes "nothing was silently lost"
         #: checkable -- see memory3l/audit.py.
+        # Replaced once an episode is bound (see _attach_ledger): creating it here
+        # would try to read from a store that has no episode yet.
         self.fact_ledger = FactLedger()
         # The manager is the authority on the window size: make sure the store
         # enforces exactly the same bound (they are configured independently).
         self.store.recent_window_turns = self.recent_window_turns
         self._bind(self.episode_id, reset=reset_on_bind, resume=resume, flush_hot_keys=flush_hot_keys)
+        self._attach_ledger(self.episode_id, fresh=reset_on_bind and not resume)
 
     # ------------------------------------------------------------------ #
     # episode lifecycle
@@ -287,13 +290,30 @@ class MemoryManager:
         # resumed episode keeps the same notion of "known slot / seen value".
         self._slot_lexicon = set()
         self._seen_values = set()
-        self.fact_ledger = FactLedger(episode_id)
+        self._attach_ledger(episode_id, fresh=not resume)
         for summary in self.store.list_active_summaries(episode_id):
             self._remember_fact_keys(summary.fact_keys or extract_fact_keys(summary.text))
         logger.debug(
             "episode %s reset (resume=%s): hot state cleared, next turn=%d",
             episode_id, resume, self.turn_index + 1,
         )
+
+    def _attach_ledger(self, episode_id: str, *, fresh: bool) -> None:
+        """
+        Bind the fact ledger to an episode.
+
+        ``fresh=True`` clears whatever is stored and starts empty: the ledger is the
+        audit record, and inheriting a previous run's rows (the namespace has no run
+        id) would both corrupt the audit and re-introduce the cross-run contamination
+        the archive already had.  ``fresh=False`` (a resume) loads the existing rows
+        so a restarted process can still explain and verify the whole history.
+        """
+        if fresh and episode_id:
+            try:
+                self.store.clear_fact_ledger(episode_id)
+            except (AttributeError, NotImplementedError):
+                pass
+        self.fact_ledger = FactLedger(episode_id, store=self.store)
 
     def _purge_episode(self, episode_id: str) -> None:
         """Hard-delete this episode's permanent layers (opt-in, never in batch)."""
@@ -421,23 +441,7 @@ class MemoryManager:
         if not getattr(config, "CURRENT_VALUES_ENABLED", True):
             return []
         limit = config.CURRENT_VALUES_MAX_SLOTS if max_slots is None else max_slots
-        latest: Dict[str, tuple] = {}
-        # Oldest -> newest, so a later turn's value overwrites an earlier one.
-        for summary in self.list_active_summaries():
-            for key in (summary.fact_keys or sorted(extract_fact_keys(summary.text))):
-                if "=" not in key:
-                    continue
-                slot = self._slot_of(key)
-                value = key.split("=", 1)[1].strip()
-                if slot and value:
-                    latest[slot] = (slot, value, summary.summary_id, summary.seq)
-        if not latest:
-            return []
-        # When the cap bites, keep the most recently updated slots; then restore a
-        # stable (chronological) display order so the block does not reshuffle.
-        ordered = sorted(latest.values(), key=lambda item: item[3], reverse=True)[: max(1, limit)]
-        ordered.sort(key=lambda item: item[3])
-        return [(slot, value, summary_id) for slot, value, summary_id, _ in ordered]
+        return derive_current_values(self.list_active_summaries(), limit)
 
     def render_current_values(self, max_slots: Optional[int] = None) -> str:
         """One compact line, or ``""`` so the prompt omits the block entirely."""
