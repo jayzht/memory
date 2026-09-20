@@ -18,3 +18,7 @@ data/longmemeval/
 # build output
 dist/
 dist-core/
+
+# Secrets: real credentials live in .env (see .env.example). This was tracked
+# once, which is why the rule is explicit rather than implied.
+.env
