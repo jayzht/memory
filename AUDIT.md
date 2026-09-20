@@ -198,7 +198,7 @@ python3 audit_server.py --sqlite-path exp_lm.db --port 8020 --token mem2024
 ## 十一、复现
 
 ```bash
-python3 -m unittest discover -s tests                        # 101 tests
+python3 -m unittest discover -s tests                        # 109 tests
 python3 audit_check.py --episodes 3 --turns 40               # 审计 + 四个必须失败的对照
 python3 audit_check.py --aggregate --episodes 6              # 附带跨 episode 聚合
 python3 gate_sweep.py --episodes 3 --turns 40                # 摘要器门控前沿（另一条线）
@@ -207,6 +207,11 @@ python3 gate_sweep.py --dataset longmemeval --lme-records 25 # 真实数据上�
 # sidecar
 python3 audit_server.py --sqlite-path exp_lm.db --port 8020 --token mem2024
 curl 'http://127.0.0.1:8020/audit?episode=three_layer%2Flong_0000&token=mem2024'
+
+# MCP（需要 mcp>=2；用独立 venv 以免污染主环境）
+python3 memory3l-mcp/scripts/seed_demo.py --db demo_ledger.db --episodes 2 --turns 30
+MEMORY3L_ROOT=$PWD PYTHONPATH=$PWD/memory3l-mcp/src \
+  .venv-mcp/bin/python -m unittest discover -s memory3l-mcp/tests   # 19 tests
 ```
 
 ---
@@ -223,4 +228,60 @@ curl 'http://127.0.0.1:8020/audit?episode=three_layer%2Flong_0000&token=mem2024'
 | `audit_server.py` | 只读审计 sidecar + 幂等事实写入 |
 | `audit_check.py` | 审计运行器 + **四个必须失败的对照** + 聚合模式 |
 | `gate_sweep.py` | 门控前沿扫描 + 真实数据证据轮诊断 |
-| `tests/test_core.py` | 101 个测试，含每个对照与每个已修 bug 的回归钉 |
+| `tests/test_core.py` | 109 个测试，含每个对照与每个已修 bug 的回归钉 |
+
+---
+
+## 十三、MCP 服务与跨 agent 分发
+
+不把审计能力锁在 sidecar 的 HTTP 里：同一个 `AuditService` 也以 MCP 工具暴露，于是任何 MCP client（Claude Code / Codex / Cursor / DSH / Copilot）都能直接调用。
+
+| 文件 | 内容 |
+|---|---|
+| `memory3l/service.py` | `AuditService`：审计面的唯一实现，sidecar 与 MCP **共用**，避免两种传输给出不同结论 |
+| `memory3l-mcp/` | PyPI 包：`MCPServer`（stdio）、自管存储路径、10 个工具 |
+| `memory3l-mcp/skills/memory-audit/SKILL.md` | 跨 agent 技能：何时用哪个工具、以及**如何不过度声称** |
+| `memory3l-mcp/server.json` | MCP Registry 元数据（`registryType: pypi`、`runtimeHint: uvx`） |
+
+**已发布**（PyPI）：`memory3l 1.0.0`、`memory3l-mcp 0.1.0`。
+
+```bash
+uvx memory3l-mcp                                  # 无需仓库、无需 MEMORY3L_ROOT
+memory3l-mcp-install-skill                        # → ~/.agents/skills/memory-audit
+```
+
+验证方式：从 PyPI 全新装（干净 venv，仓库不在 `sys.path`）→ stdio 握手 10 个工具 → `store_info` / `list_episodes` / `audit` 全部返回正确结果。
+
+为此做了一处必要的重构：`config.py` 原本在仓库根、被 4 个包内模块 `import config`，**装成 wheel 后 `import memory3l` 会直接失败**。现在配置移入 `memory3l/config.py`，包内改用相对导入，仓库根 `config.py` 保留为**模块别名**（`sys.modules[__name__] = memory3l.config`）——因为根脚本（`evaluation.py` 等）不只读它，还会**写**它（CLI flag 回写），若用 `import *` 会变成两个对象、flag 静默失效。
+
+
+设计取舍：
+
+* **默认只读**。10 个工具里 9 个只读；唯一的写入口 `append_facts` 仅在 `--allow-write` / `MEMORY3L_ALLOW_WRITE=1` 时注册。
+* **空库可服务**。`SQLiteColdStore` 自动建目录与建表，因此新装机器上 server 能启动并回答 `episodes: []`，而不是崩溃——"装了没反应"是即插即用最常见的死法。
+* **未知 episode 是错误，不是空结果**。零事实的 episode 平凡满足全部不变式，所以对拼错的 id 返回 `ok: true` 会是一张**虚假的健康证明**。工具显式报 `unknown episode` 并列出真实 id。
+* **不需要 `bind_episode` 的冷存储**（本次补上）：见下。
+
+### 顺带修掉的一个潜伏契约违规（由 I1 抓出）
+
+`SQLiteColdStore.remove_active_summary` 原本只执行 DELETE 并返回 `None`，而 `BaseMemoryStore` 的契约是返回被移除的 `ActiveSummary`。`MemoryManager` 的 override 路径正是靠这个返回值决定是否归档：
+
+```python
+old = self.store.remove_active_summary(overridden_id, episode_id=self.episode_id)
+if old is None:
+    continue                                   # ← 永远命中，归档被跳过
+self.store.add_archived_summary(ArchivedSummary.from_active(old, ...))
+```
+
+后果是**每一次 override 都静默丢弃被覆盖的摘要**：`archived=0`、`missing=9`。
+
+为什么以前没暴露：hybrid 路径先自己 `get_active_summary` 取值、再忽略冷库返回值，把它掩盖了。本次给冷库补上 episode 绑定 / 轮次记账 / 窗口追加，使它**能单独驱动 manager**，才把这个潜伏违规暴露出来。
+
+证据链（可复现）：
+
+| 行为 | 回归测试 | I1 实测 |
+|---|---|---|
+| 修复前（monkeypatch 还原） | **必须失败**（已确认） | `ok=false, ledger=15, archived=0, missing=9` |
+| 修复后 | 通过 | `ok=true, ledger=15, archived=9, missing=0` |
+
+这是"可审计"这一主张的正面证据：审计面不是装饰，它在真实代码库里抓到了一个其它测试全绿时看不见的数据丢失。

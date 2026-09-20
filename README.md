@@ -579,6 +579,10 @@ web_ui.py + web_ui.html       # 可视化：索引层/四层记忆 + 每次提�
 memory3l/
 ├── models.py                 # 数据模型 + ToolCall/ToolResult/MemoryTurnStats
 ├── memory_manager.py         # ★ MemoryManager：三层维护、事件覆盖、容量压缩
+├── audit.py                  # ★ 可审计面：append-only 台账、I1–I5、AuditReport
+├── service.py                # ★ AuditService：审计面唯一实现（sidecar 与 MCP 共用）
+├── temporal.py               # SCD-2 时态投影、契约查询、异常检测、DDL
+├── gate.py                   # 摘要器内容门控（4 档）
 ├── prompts.py                # 摘要/合并/Agent/裁判 prompt，上下文拼接顺序
 ├── llm.py                    # LLM 后端：ollama / openai / heuristic(离线) / scripted(测试)
 ├── tools.py                  # 文本 function call 解析 + 两个归档工具执行器
@@ -591,18 +595,22 @@ memory3l/
 └── store/
     ├── base.py               # BaseMemoryStore 抽象 + InMemoryStore
     ├── redis_store.py        # Redis 热点层（命名空间/SCAN 清理/可降级）
-    ├── sqlite_store.py       # SQLite 冷层（六张表、断点、结果落库）
+    ├── sqlite_store.py       # SQLite 冷层（含 fact_ledger；可单独驱动 manager，无需 Redis）
     └── hybrid_store.py       # 混合存储（SQLite 为真源，Redis 可丢）
+audit_server.py               # 只读审计 sidecar（HTTP）+ 幂等事实写入
+audit_check.py                # 审计运行器 + 四个必须失败的对照
+gate_sweep.py                 # 门控前沿扫描 + 真实数据证据轮诊断
+memory3l-mcp/                 # ★ MCP 服务（PyPI 包）+ 跨 agent 技能，见 AUDIT.md 第十三节
 tests/
 ├── test_core.py              # 解析、覆盖语义、容量压缩、窗口、工具循环
-└── test_store.py             # episode 隔离、Redis 命名空间(假客户端)、SQLite 持久化
+└── test_store.py             # episode 隔离、Redis 命名空间(假客户端)、SQLite 持久化、冷库单独可用
 data/sample_episodes.json     # 手写示例数据集（中英、含更新与无更新对照）
 ```
 
 运行测试（无需网络 / Redis / 模型）：
 
 ```bash
-python -m unittest discover -s tests -v     # 67 tests
+python -m unittest discover -s tests -v     # 109 tests
 ```
 
 ---
