@@ -6,3 +6,6 @@ data/longmemeval/
 *.db
 *.db-wal
 *.db-shm
+
+# scratch
+.commit_msg.tmp
