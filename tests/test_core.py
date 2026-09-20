@@ -15,7 +15,12 @@ import sys
 import tempfile
 import unittest
 
+# The repository root, so `memory3l` resolves when this file is run directly...
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ...and this directory, so the sibling `test_store` import (FakeRedis) resolves
+# under `python -m unittest tests.test_core`.  Discovery puts this directory on the
+# path by itself, which is why the gap only shows up when running one module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from memory3l.dataset import build_synthetic_episodes, HISTORY_FACT
 from memory3l.llm import HeuristicLLM, ScriptedLLM
@@ -1240,13 +1245,19 @@ class TestAuditSidecar(unittest.TestCase):
         httpd = build_server("127.0.0.1", 0, self.db, "tok")
         port = httpd.server_address[1]
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        # Loopback must not go through an ambient proxy.  With http_proxy exported
+        # -- which is normal in CI and on a corporate network -- urllib routes even
+        # 127.0.0.1 through the proxy, and the JSON decode below then fails on the
+        # proxy's error page instead of on anything the sidecar did.  An opener with
+        # an empty ProxyHandler is the standard way to say "no proxy for this".
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             def get(path, token="tok"):
                 url = f"http://127.0.0.1:{port}{path}"
                 if token is not None:
                     url += ("&" if "?" in path else "?") + f"token={token}"
                 try:
-                    with urllib.request.urlopen(url, timeout=5) as response:
+                    with opener.open(url, timeout=5) as response:
                         return response.status, _json.loads(response.read().decode())
                 except urllib.error.HTTPError as exc:
                     return exc.code, _json.loads(exc.read().decode())
@@ -1312,7 +1323,7 @@ class TestAuditSidecar(unittest.TestCase):
                     headers={"Content-Type": "application/json"},
                 )
                 try:
-                    with urllib.request.urlopen(request, timeout=5) as response:
+                    with opener.open(request, timeout=5) as response:
                         return response.status, _json.loads(response.read().decode())
                 except urllib.error.HTTPError as exc:
                     return exc.code, _json.loads(exc.read().decode())
