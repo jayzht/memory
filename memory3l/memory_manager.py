@@ -23,8 +23,12 @@ Robustness rules that protect the metrics
 -----------------------------------------
 * A hallucinated override id (not present in the active chain) is dropped and
   counted in ``invalid_override_ids`` -- it can never corrupt the archive graph.
-* When a turn overrides summaries, no capacity compression runs in the same
-  turn; the two mechanisms stay independently attributable in the CSV.
+* The two compression mechanisms are counted in *separate* fields
+  (``overrides_events`` / ``capacity_compressions``) and a capacity merge never
+  emits an OVERRIDES tag.  They are not mutually exclusive within a turn: a turn
+  that overrides a summary may still need to file others to stay in budget, so one
+  turn can set both flags.  (An earlier docstring claimed a guard that never
+  existed; adding one would only obscure the metrics.)
 * If the summariser call fails, the turn is still recorded (raw + window) and the
   failure is reported in the stats; the episode does not crash.
 """
@@ -184,8 +188,9 @@ class MemoryManager:
         self.lazy_enabled = bool(config.LAZY_MODE) and self.chain_strategy == "index"
         #: run the O(n) store-vs-manager consistency check on every turn (debug aid)
         self.strict_integrity = bool(getattr(config, "STRICT_INTEGRITY", False))
-        #: adaptive preview switch: turned off when previews would keep layer 1 over
-        #: budget, restored once there is room again.
+        #: adaptive preview switch: dropped when previews would keep layer 1 over
+        #: budget, restored once there is comfortable room again (with hysteresis,
+        #: so it cannot oscillate around the limit).
         self._previews_on = True
         self.overrides = 0
         self.summarizer_failures = 0
@@ -440,15 +445,6 @@ class MemoryManager:
         formatting overhead (ids, tags, raw_refs).
         """
         return sum(estimate_tokens(s.render()) for s in self.list_active_summaries())
-
-    def build_prompt_context(self) -> Dict[str, str]:
-        """The two memory blocks as they will be rendered into the prompt."""
-        from .prompts import render_active_chain, render_recent_window
-
-        return {
-            "recent_window": render_recent_window(self.get_window()),
-            "active_chain": render_active_chain(self.list_active_summaries()),
-        }
 
     # ------------------------------------------------------------------ #
     # main entry point
@@ -816,111 +812,6 @@ class MemoryManager:
         )
         return list(reversed(kept))
 
-    def _summarise_turn(self, record: RawDialogRecord, stats: MemoryTurnStats) -> Optional[ActiveSummary]:
-        chain = self._chain_for_summariser()
-        new_turn = f"user: {record.user_msg}\nagent: {record.agent_msg}"
-
-        if self.summarizer is None:
-            # No LLM attached (pure storage test): store the turn verbatim as the
-            # summary so downstream layers still hold a usable fact.
-            summary_text, override_ids, raw_output = new_turn, [], ""
-            parsed_fact_keys = []
-        else:
-            messages = [
-                {"role": "system", "content": summarizer_system_prompt(self.max_summary_tokens)},
-                {
-                    "role": "user",
-                    "content": summarizer_user_prompt(new_turn, chain, turn_index=stats.turn_index),
-                },
-            ]
-            # Real models occasionally omit the mandatory tag.  One explicit
-            # format reminder is issued; whether it was needed is recorded, so the
-            # effect on the metrics stays auditable instead of hidden.
-            attempts = 1 + (1 if config.SUMMARIZER_FORMAT_RETRY else 0)
-            parsed = None
-            for attempt in range(attempts):
-                try:
-                    response = self.summarizer.generate(messages, json_mode=False)
-                    raw_output = response.text
-                except LLMError as exc:
-                    self.summarizer_failures += 1
-                    logger.warning("summariser failed on turn %d: %s", stats.turn_index, exc)
-                    stats.summarizer_raw_output = f"<ERROR> {exc}"
-                    return None
-                try:
-                    parsed = parse_summary_response(
-                        raw_output, valid_ids=[s.summary_id for s in chain]
-                    )
-                except SummaryParseError as exc:
-                    self.summarizer_failures += 1
-                    logger.warning("unparsable summary on turn %d: %s", stats.turn_index, exc)
-                    stats.summarizer_raw_output = raw_output
-                    return None
-                stats.summarizer_raw_output = raw_output
-                if not parsed["missing_tag"] or attempt == attempts - 1:
-                    break
-                stats.format_retry_used = True
-                logger.debug(
-                    "turn %d: summariser omitted the OVERRIDES tag; retrying with a reminder",
-                    stats.turn_index,
-                )
-                messages = messages + [
-                    {"role": "assistant", "content": raw_output},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your reply did not contain the mandatory final line. "
-                            "Reply again with ONLY the summary followed by a final line "
-                            "[OVERRIDES: none] or [OVERRIDES: id1,id2] using ids that literally "
-                            "appear in <ACTIVE_CHAIN>."
-                        ),
-                    },
-                ]
-            summary_text = self._bound_summary_text(parsed["summary_text"], stats)
-            override_ids = parsed["override_ids"]
-            parsed_fact_keys = list(parsed.get("fact_keys") or [])
-            stats.invalid_override_ids = parsed["invalid_override_ids"]
-            if not parsed["valid"]:
-                self.summarizer_failures += 1
-                logger.warning("empty summary body on turn %d", stats.turn_index)
-                return None
-
-        new_summary = ActiveSummary(
-            summary_id=make_id(self.episode_id, "s", self._next_seq(), salt=summary_text),
-            text=summary_text,
-            override_ids=override_ids,
-            timestamp=now_ts(),
-            raw_ref_id=record.reference_id,
-            episode_id=self.episode_id,
-            seq=self._seq,
-            origin="event",
-            raw_ref_ids=[record.reference_id],
-            # Explicit keys from the [FACTS: ...] line; lexical fallback keeps the
-            # fact-safety rule working when a model omits that line.
-            fact_keys=parsed_fact_keys or sorted(extract_fact_keys(summary_text)),
-        )
-        self.store.add_active_summary(new_summary, episode_id=self.episode_id)
-
-        # Override resolution always uses the FULL chain: capping is a display
-        # concern only, never a correctness one.
-        chain_ids = {s.summary_id for s in self.store.list_active_summaries(self.episode_id)}
-        for overridden_id in override_ids:
-            if overridden_id not in chain_ids:
-                continue  # defensive: parse layer already filtered, keep it safe
-            old = self.store.remove_active_summary(overridden_id, episode_id=self.episode_id)
-            if old is None:
-                continue
-            self.store.add_archived_summary(
-                ArchivedSummary.from_active(
-                    old,
-                    is_overridden=True,
-                    superseded_by=new_summary.summary_id,
-                    archive_reason="overridden",
-                ),
-                episode_id=self.episode_id,
-            )
-        return new_summary
-
     # ------------------------------------------------------------------ #
     # Hierarchy: build an index (title) level above the summaries
     # ------------------------------------------------------------------ #
@@ -941,6 +832,12 @@ class MemoryManager:
            once there are more than ``INDEX_MAX_ENTRIES`` of them, so the index
            layer does not grow linearly with the episode either.
         """
+        # Restore previews once there is comfortable room (hysteresis at 70% of the
+        # budget).  The comment used to promise this while nothing implemented it,
+        # which made previews a one-way switch.
+        if not self._previews_on and self.active_chain_tokens() < self.active_chain_token_limit * 0.7:
+            self._previews_on = True
+
         if self.active_chain_tokens() <= self.active_chain_token_limit:
             return False
 

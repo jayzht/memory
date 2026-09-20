@@ -147,8 +147,10 @@ INDEX_MIN_VISIBLE: int = _env_int("INDEX_MIN_VISIBLE", 1)
 LAZY_MODE: bool = _env_bool("LAZY_MODE", True)
 # How many of the newest summaries always stay rendered verbatim in the prompt.
 INDEX_RENDER_RECENT: int = _env_int("INDEX_RENDER_RECENT", 2)
-# Hard cap on index entries built per turn (stability guard: without it a
-# mis-calibrated loop once produced 800 entries and 11k-token prompts).
+# Hard cap on the hierarchy operations one turn may perform (stability guard:
+# without it a mis-calibrated loop once produced 800 entries and an 11k-token
+# prompt).  The budget is 3x INDEX_MAX_PER_TURN operations, because a turn may need
+# to fold old titles in addition to filing new groups.
 INDEX_MAX_PER_TURN: int = _env_int("INDEX_MAX_PER_TURN", 2)
 # --- current-value registry ------------------------------------------------ #
 # A small always-rendered block ``属性=最新值; ...`` derived from the live
@@ -165,12 +167,10 @@ CURRENT_VALUES_MAX_SLOTS: int = _env_int("CURRENT_VALUES_MAX_SLOTS", 12)
 # (the built string was allowed 220).
 INDEX_TITLE_CHARS: int = _env_int("INDEX_TITLE_CHARS", 120)
 # How many summariser calls to run concurrently while ingesting a dialogue.
-# 0/1 = strictly sequential.  Concurrency changes only the wall clock: override
-# resolution stays sequential, so the resulting memory is identical.
-# NOTE: windowed concurrency currently produces a different override graph than
-# sequential ingestion (batched turns share one chain snapshot, so a turn cannot
-# see the summary of the turn before it).  Sequential is the default so that
-# measured results are correct; concurrency stays available for experimentation.
+# 1 = strictly sequential and the only semantics-preserving setting; >1 is a
+# wall-clock optimisation that is NOT equivalent: turns inside one window share a
+# chain snapshot, so a turn cannot override a summary created in the same window.
+# Sequential is the default so measured results are correct.
 INGEST_CONCURRENCY: int = _env_int("INGEST_CONCURRENCY", 1)
 # "index" = build a level above the summaries (keeps every summary readable);
 # "merge" = the older flat behaviour (LLM rewrites several summaries into one).

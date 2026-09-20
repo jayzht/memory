@@ -12,6 +12,32 @@
 
 ---
 
+## 0. 审查后的重要更正（读实验结果前必读）
+
+一次独立的代码审查发现，**若干已归档的真实实验数字是在有缺陷的代码上跑出来的**。
+修复清单见 `REVIEW_FINDINGS.md`；下面是最影响结论的几条：
+
+| 问题 | 影响 |
+|---|---|
+| **Redis 序列化丢字段**：`_load_summary` 丢 `fact_keys`/`index_id`，`loads_index` 丢 `previews`/`child_index_ids`；SQLite 的 `index_entries` 表根本没有后两列 | 所有真实运行都走 `redis_sqlite_hybrid`。索引标题的 `属性=当前值` digest **恒为空**；索引行回退渲染**整条成员摘要**（实测索引层 474→317 tok/轮，约 1/3 成本虚高）；"顶层不可达"的主因是这个 bug，不是架构 |
+| **`_fact_digest` 顺序反了** | 标题把**最旧**的值标成"当前值"，历史也倒着写（`工位=1楼[3楼→2楼→1楼]`）。索引层一直在顶层显示**错误的当前值** |
+| **索引条目在覆盖后不变** | `size` 虚高、`expand_index` 返回条数对不上、预览与 digest 仍显示已被取代的旧值 |
+| **基线被灌输了它们没有的工具** | `memgpt_style`/`naive_chain` 的 executor 为 None，却收到"必须先调用工具"的提示与工具手册 → 模型输出工具调用，无法执行，**该字符串直接成为它的答案**并被判错。三项基线被系统性压低 |
+| **`--system all` 直接崩溃** | `memgpt_style` 的 chain token 是 `None`（故意表示 n/a），进度行却用 `:.0f` 格式化 → 崩溃，且**不产出任何结果文件** |
+| **多系统 `predictions.csv` 重复** | 累积行被反复 append（4 系统 × n 题 → 10n 行，权重 4:3:2:1），`analyze_results` 读的就是这个文件 |
+| **resume 丢失指标** | 已完成的 episode 被跳过却不回读，`metrics.csv` 只覆盖本次进程跑的部分；首次 flush 还会把 `predictions.csv` 截断 |
+| **跨 run 归档污染** | 归档命名空间是 `system/episode`，不含 run id，且 `reset` 保留归档 → 换 run-id 重跑会继承上一次的死数据（实测某 40 轮 cap=0 的 episode 报告 `archived_final=101`） |
+| **成本无法归因** | 摘要/裁判与回答共用同一个 client，`summarizer_stats` 是同一个计数器的第二次读取（490/490、token 完全相同） |
+| **自行写记忆的块会泄漏进答案** | "回复只有该块"时返回的是**原始带标签文本**；多块时只剥第一个 |
+| **合成数据集 History 标准答案错误** | 一个属性变两次会生成两条**措辞相同、gold 不同**的探针，其中一条必然判错 |
+| **LongMemEval 两处** | `--lme-types` 配默认 `--limit 50` 返回 **0 条**（先截断扫描再过滤）；轮级截断是纯尾部截断，会把证据会话切掉，而 meta 仍声称保留了 |
+
+**结论**：`results/final_ab`、`results/final_merge` 等**修复前**产物的绝对数字不可直接引用；
+结构性结论（"摘要+归档+精确回查"成立、索引优于容量合并、成本需要按 session 粒度优化）方向仍然成立，
+但需要重跑才能得到可引用的数字。修复后 `index` 与 `merge` 的对比需要在同一份新代码上重做。
+
+---
+
 ## 1. 快速开始
 
 ```bash
@@ -80,7 +106,7 @@ python chat_debug.py --store memory --llm-backend heuristic
 
 实现约束（保证指标可归因）：
 
-* 同一轮只要发生了事件覆盖，就 **不再** 触发容量压缩 → 两种机制在 CSV 里可分离统计。
+* 两种压缩机制在 CSV 里用**独立字段**统计（`overrides_events` / `capacity_compressions`），且容量合并永不产生 OVERRIDES 标签。**但两者并非互斥**：一轮里覆盖了旧摘要、同时又把别的摘要归档以压回预算，是完全正常的，该轮的 `event_triggered` 与 `capacity_triggered` 会同时为真。（早期文档声称有"覆盖当轮不再压缩"的护栏，代码里从来没有；补上它只会让指标更难解释。）
 * 容量压缩 **不会合并本轮刚产生的新摘要** → 最新事实始终可单独读取。
 * 摘要器幻觉出的 id（不在活跃链中）被 **丢弃并计数**（`invalid_override_ids`），绝不污染归档图谱。
 
@@ -349,10 +375,22 @@ python web_ui.py --llm-backend deepseek --model deepseek-flash --num-episodes 3 
 2. **懒展开渲染**：链条涨大后，prompt 只给索引层 + 最近 `KEEP_RECENT` 条，其余全部靠工具按需展开。
 3. **递归索引**：索引条目数超阈值时再往上加一层，形成真正的多级目录。
 
-### 5.3 懒展开：真正把成本压下去的那一步
+### 5.3 懒展开（v2：已修正；它本身不省 token，省 token 的是"挂到标题下"）
 
 前两版的问题是"**收纳了但没省**"：被标题收录的摘要仍然逐条渲染，于是链条超预算 → 索引继续建 →
 标题和预览反而变成新的开销（最坏一次跑出 800 个索引条目、1 万多 token 的 prompt）。
+
+> **⚠️ 更正（代码审查后）。** 本节原先称懒展开是"真正把成本压下去的那一步"。审查发现：
+> 1. `chain_summaries()` 从来没有排除 `LAZY_INDEX_ID`，所以"懒存"的摘要**一直照常渲染**——契约没实现；
+> 2. 判定"两跳成员"的逻辑读的是**已经被折叠删除**的子目录 id，恒为空集；
+> 3. 即使修好，它对渲染也**没有增量贡献**：`chain_summaries()` 按 live 目录项的 `members` 过滤，
+>    而超级索引的 `members` 是传递闭包，两跳成员本来就不渲染。
+>
+> 也就是说：**已归档实验结果里 `lazy_summary_count` 全部为 0，懒展开从未生效过**，
+> 那段 A/B 里 `index` 比 `merge` 省下的 token，全部来自"挂到标题下 + 超级索引折叠"。
+> 现在 `chain_summaries()` 已排除 `LAZY_INDEX_ID`，covered 判定改为读 live 超级索引自身，
+> 并把"把**未归档**摘要转成懒存"这条分支删掉了——那种摘要没有任何指针，藏起来就是真的不可达。
+> 懒展开现在的定位是**两跳成员的可观测簿记**，不是成本机制。
 
 现在的渲染契约（三分法，**每一层都可按 id 取回**）：
 
@@ -360,7 +398,7 @@ python web_ui.py --llm-backend deepseek --model deepseek-flash --num-episodes 3 
 |---|---|---|
 | 被标题引用（`index_id` 指向某个目录项） | **不渲染**（只在目录里占一行标题） | `expand_index(index_id)` 展开该目录，或直接 `get_archived_summary(summary_id)` |
 | 未进任何目录 | 渲染（这就是"活跃链"的本义） | 直接可见 |
-| 懒存（`index_id = __LAZY_SUMMARIES__`，即所属标题已被上层折叠） | 不渲染 | 按 `summary_id` 精确取回 |
+| 懒存（`index_id = __LAZY_SUMMARIES__`，即所属标题已被上层折叠） | 不渲染（v2 起才真正成立） | 按 `summary_id` 精确取回 |
 
 配套的稳定性护栏（上一轮跑飞的直接教训）：
 
@@ -495,6 +533,42 @@ ERROR integrity at fill_counts: store returned 610129 summaries
 开关：`config.SELF_WRITE_MEMORY`（环境变量同名，默认开）；`chat_debug.py --self-write/--no-self-write`。
 指标里新增 `self_written_turns` / `self_write_fallbacks`，回退率是可观测的。
 
+### 5.6 当前值登记表（`<CURRENT_VALUES>`，新增）
+
+索引标题本来是"当前值"的唯一顶层出口，但它会截断、按组重算、还会在成员被覆盖后过期——
+真实数据里的决定性失效模式（值只存在于某个索引成员里）正是这么来的。
+
+登记表把"当前值"从标题的职责里摘出来：从**活跃摘要已有的 `fact_keys`** 派生
+"每个槽位的最新值"，固定渲染在滑动窗口之后、索引层之前：
+
+```
+<CURRENT_VALUES>
+工位楼层=12楼; 会议时间=下午2点
+</CURRENT_VALUES>
+```
+
+* **零额外 LLM 调用**：`fact_keys` 本来就存在摘要上；
+* **不会过期**：被覆盖/被合并的摘要自然不再贡献（它是派生的，不是增量维护的第二份真相）；
+* **成本**：约 10~15 tok/槽位，实测 2 个槽位 10 tok；上限 `CURRENT_VALUES_MAX_SLOTS`（默认 12），
+  超出时保留**最近更新**的槽位；
+* **开关**：`CURRENT_VALUES_ENABLED`（默认开）；成本单独记在 `current_values_tokens` /
+  `avg_current_values_tokens`，也计入渲染口径（`Avg_Active_Chain_Tokens_rendered`）与预算触发。
+
+它同时也是"容量合并/索引归档不得吃掉最新事实"这条规则的结构性保障：
+即使某条摘要被归档或折叠，它的**当前值**仍然在顶层可见。
+
+### 5.7 指标口径（v2 修正）
+
+* `Avg_Active_Chain_Tokens`：四个系统现在都上报**每轮均值**，且都是**实际渲染**的量。
+  旧版把 `three_layer` 的每轮均值、`naive_chain` 的终态总量、`full_context` 的**未截断**存储量
+  混在同一列里比较。
+* `Avg_Active_Chain_Tokens_rendered`：渲染口径（three_layer = 链 + 索引 + 登记表 + 滑动窗口）。
+* `Memory_Point_Acc` / `_n`（新增）：`MEMORY_POINT` 探针的答题正确率。此前只累计到每 episode 的
+  CSV，从未聚合，"工具调用成功但归档内容答错"在总表上没有任何体现。
+* `Tool_Call_Unparsable` 的 per-probe 列此前恒为 0（日志条目没有 `parsed` 键）。
+
+---
+
 ## 6. 项目结构
 
 ```
@@ -528,7 +602,7 @@ data/sample_episodes.json     # 手写示例数据集（中英、含更新与无
 运行测试（无需网络 / Redis / 模型）：
 
 ```bash
-python -m unittest discover -s tests -v     # 34 tests
+python -m unittest discover -s tests -v     # 67 tests
 ```
 
 ---

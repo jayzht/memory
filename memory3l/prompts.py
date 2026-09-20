@@ -25,7 +25,7 @@ from typing import List, Optional, Sequence
 
 import config
 
-from .models import ActiveSummary, ArchivedSummary, IndexEntry, RawDialogRecord
+from .models import ActiveSummary, IndexEntry, RawDialogRecord
 
 # Prompt language: "zh" (default) or "en".
 PROMPT_LANG = os.environ.get("PROMPT_LANG", "zh").lower()
@@ -477,18 +477,6 @@ def render_index_layer(entries) -> str:
             entry, depth = item, config.INDEX_PREVIEW
         lines.append(entry.render(preview=depth))
     return "\n".join(lines)
-
-
-def render_archived_summary(archived: ArchivedSummary, superseded_by_text: Optional[str] = None) -> str:
-    body = archived.render()
-    if archived.superseded_by and superseded_by_text is not None:
-        body += (
-            f"\n[NOTE] This summary was replaced by {archived.superseded_by}. "
-            f"Current value from that summary: {superseded_by_text}"
-        )
-    elif archived.superseded_by:
-        body += f"\n[NOTE] This summary was replaced by {archived.superseded_by}."
-    return body
 
 
 def build_memory_block(

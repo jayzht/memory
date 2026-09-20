@@ -1,5 +1,18 @@
 # 交接文档：三层记忆系统（Memory）
 
+> ⚠️ **2026-09-20 更新：本文件的部分结论已被一次独立架构审查推翻，请先读 `REVIEW_FINDINGS.md`。**
+>
+> 最需要注意的几条：
+> * **§4 里的实测数字是在有缺陷的代码上跑出来的，绝对数字不可引用**（Redis 序列化丢字段 →
+>   索引 digest 恒为空、索引层成本虚高约 1/3；`_fact_digest` 顺序反了 → 标题显示错误的"当前值"；
+>   基线被灌输了它们没有的工具 → 三项基线被系统性压低）。结构性方向仍成立，需要重跑。
+> * **`--system all` 此前必崩且不产出结果文件**（已修）。§1 的冒烟命令建议改用
+>   `REVIEW_FINDINGS.md` §10 里的版本。
+> * **§3.3 的"懒展开"从未生效**，且它本来就不省 token（省 token 的是"挂到标题下"）。已更正 README §5.3。
+> * **单测现在是 67 个**（原 43），`python3 -m unittest discover -s tests`。
+> * 新增 `<CURRENT_VALUES>` 当前值登记表（README §5.6），针对"顶层不可达"的结构性修复。
+> * §6 ① 的"按 session 粒度摘要"**仍然是最该做的下一步**（成本大头未变）。
+
 > 写给**下一个对话的自己**。目标是让新会话在 10 分钟内接手，不重复踩坑。
 > 最后更新：本轮会话结束（self-write 功能刚落地并通过真实 DeepSeek 验证）。
 
@@ -187,7 +200,7 @@ python3 web_ui.py --llm-backend deepseek --model deepseek-flash --num-episodes 3
 索引层 + 超级索引 + 懒展开、4 个精确 id 工具、4 套系统（3 基线）、指标与 CSV/断点续跑、
 Redis+SQLite 混合存储、LongMemEval 适配器、可视化页面、self-write。
 
-**测试**：`python3 -m unittest discover -s tests` → **43 passed**
+**测试**：`python3 -m unittest discover -s tests` → **67 passed**（审查前为 43）
 （`tests/test_core.py` + `tests/test_store.py`）。
 **改动后一定要重跑**，这是唯一的安全网。
 
@@ -313,14 +326,14 @@ DeepSeek 官方价（元/M token）：flash 输入 2（峰）/1（谷），输�
 | `tests/test_core.py` | `TestSelfWrittenMemory` 5 个测试（一轮一次调用、override 映射、回退不重复写 raw、剥块变体） |
 | `README.md` | 新增 §5.5（设计 + 实测表 + 适用边界）、§5 配置表加一行、§8 加槽位漂移限制 |
 
-**验证状态**：43 单测全过；真实 DeepSeek 两轮对话验证 —— 2 轮 = **2 次 LLM 调用**（原 4 次），
+**验证状态**：审查时为 43 单测全过（现为 67）；真实 DeepSeek 两轮对话验证 —— 2 轮 = **2 次 LLM 调用**（原 4 次），
 第 2 轮模型自写 `[OVERRIDES: s001]` 正确映射为规范 id，s001 归档、s002 上链，答案无块泄漏。
 
 ---
 
 ## 10. 新会话建议的第一个动作
 
-1. 读 `README.md` §5.1–5.5（尤其 §5.5 和 §8）。
-2. `python3 -m unittest discover -s tests` 确认 43 过。
+1. **先读 `REVIEW_FINDINGS.md`**（审查发现与修复记录），再读 `README.md` §0 / §5.5–5.7。
+2. `python3 -m unittest discover -s tests` 确认 67 过。
 3. 问用户：**先做 §6 ①（按 session 粒度摘要，评测降本 10×），还是先跑 10/20 题小样本拿真实分数？**
    —— 上一轮我建议前者，用户说要开新对话，还没答复。

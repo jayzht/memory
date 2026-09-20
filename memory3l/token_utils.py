@@ -16,7 +16,7 @@ can be interpreted unambiguously.
 from __future__ import annotations
 
 import re
-from typing import Iterable, List, Sequence
+from typing import Iterable, Sequence
 
 try:  # optional dependency
     import tiktoken  # type: ignore
@@ -118,26 +118,6 @@ def truncate_to_tokens(text: str, limit: int, suffix: str = " ...") -> str:
         else:
             hi = mid - 1
     return text[:lo] + suffix
-
-
-class TokenCounter:
-    """Small convenience wrapper so callers can log which counter was used."""
-
-    name = TOKENIZER_NAME
-
-    def count(self, text: str) -> int:
-        return estimate_tokens(text)
-
-    def count_many(self, texts: Iterable[str]) -> int:
-        return estimate_tokens_many(texts)
-
-    def count_messages(self, messages: Sequence[dict]) -> int:
-        return count_message_tokens(messages)
-
-
-def active_chain_tokens(texts: List[str]) -> int:
-    """Tokens of the rendered active chain (used for the compression trigger)."""
-    return estimate_tokens_many(texts)
 
 
 # --------------------------------------------------------------------------- #
